@@ -139,6 +139,20 @@ For sessions (**System → Global Configuration → System → Session**):
 | Redis Server Port | `6379` |
 | Redis Server Database | `1` *(separate DB from cache)* |
 
+### PHP Session Locking (automatic)
+
+When Redis is used as a session handler, PHP's `phpredis` extension requires session locking to prevent race conditions. Without it, concurrent AJAX requests (common in Joomla admin) can corrupt session data, causing random 500 errors and "poltergeist" behavior.
+
+RedisManager **automatically deploys** a `.user.ini` file to all document roots when enabling Redis for a user:
+
+```ini
+redis.session.locking_enabled = 1
+redis.session.lock_retries = 300
+redis.session.lock_wait_time = 10000
+```
+
+This is removed automatically when Redis is disabled. If you add new domains to the account after enabling Redis, run `redismanager-ctl disable <user>` followed by `redismanager-ctl enable <user>` to redeploy the session locking config to all document roots.
+
 ### Other CMS / Frameworks
 
 Any application that supports Redis via Unix sockets can use the managed instance. The connection details are always:

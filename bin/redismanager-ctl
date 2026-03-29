@@ -144,6 +144,91 @@ check_budget() {
     fi
 }
 
+# --- Session locking ---
+
+USERINI_MARKER_BEGIN="; >>> RedisManager session locking — do not edit"
+USERINI_MARKER_END="; <<< RedisManager"
+USERINI_CONTENT="redis.session.locking_enabled = 1
+redis.session.lock_retries = 300
+redis.session.lock_wait_time = 10000"
+
+deploy_session_locking() {
+    local user="$1"
+    local homedir="/home/${user}"
+
+    # Find all document roots for this user (main + addon/sub domains)
+    local docroots=()
+    docroots+=("${homedir}/public_html")
+
+    # Also check addon/subdomain docroots from cPanel userdata
+    if [[ -d "/var/cpanel/userdata/${user}" ]]; then
+        for f in "/var/cpanel/userdata/${user}"/*; do
+            [[ -f "$f" ]] || continue
+            [[ "$f" == *.cache ]] && continue
+            [[ "$(basename "$f")" == "main" ]] && continue
+            local dr
+            dr=$(grep -m1 '^documentroot:' "$f" 2>/dev/null | awk '{print $2}')
+            if [[ -n "$dr" && -d "$dr" && "$dr" != "${homedir}/public_html" ]]; then
+                docroots+=("$dr")
+            fi
+        done
+    fi
+
+    for docroot in "${docroots[@]}"; do
+        [[ -d "$docroot" ]] || continue
+        local ini_file="${docroot}/.user.ini"
+
+        # Skip if our block already exists
+        if [[ -f "$ini_file" ]] && grep -qF "$USERINI_MARKER_BEGIN" "$ini_file" 2>/dev/null; then
+            continue
+        fi
+
+        # Append our block
+        {
+            echo ""
+            echo "$USERINI_MARKER_BEGIN"
+            echo "$USERINI_CONTENT"
+            echo "$USERINI_MARKER_END"
+        } >> "$ini_file"
+
+        chown "${user}:${user}" "$ini_file"
+        chmod 644 "$ini_file"
+        log "Deployed .user.ini session locking to ${docroot}"
+    done
+}
+
+remove_session_locking() {
+    local user="$1"
+    local homedir="/home/${user}"
+
+    # Find all .user.ini files with our marker
+    while IFS= read -r ini_file; do
+        [[ -f "$ini_file" ]] || continue
+
+        # Remove our block (marker begin → marker end, inclusive)
+        local tmp="${ini_file}.rmtmp"
+        awk -v begin="$USERINI_MARKER_BEGIN" -v end="$USERINI_MARKER_END" '
+            $0 == begin { skip=1; next }
+            $0 == end   { skip=0; next }
+            !skip { print }
+        ' "$ini_file" > "$tmp"
+
+        # Remove trailing blank lines
+        sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp" 2>/dev/null || true
+
+        # If file is now empty (only whitespace), remove it; otherwise replace
+        if [[ ! -s "$tmp" ]] || ! grep -qP '\S' "$tmp" 2>/dev/null; then
+            rm -f "$ini_file" "$tmp"
+            log "Removed empty .user.ini from $(dirname "$ini_file")"
+        else
+            mv "$tmp" "$ini_file"
+            chown "${user}:${user}" "$ini_file"
+            chmod 644 "$ini_file"
+            log "Cleaned .user.ini session locking from $(dirname "$ini_file")"
+        fi
+    done < <(find "$homedir" -name ".user.ini" -exec grep -lF "$USERINI_MARKER_BEGIN" {} + 2>/dev/null || true)
+}
+
 # --- Commands ---
 
 cmd_enable() {
@@ -185,6 +270,9 @@ cmd_enable() {
     # Update state
     state_set "$user" "$memory_mb"
 
+    # Deploy .user.ini with Redis session locking for all document roots
+    deploy_session_locking "$user"
+
     log "ENABLED Redis for user=$user memory=${memory_mb}MB"
 
     # Show connection info
@@ -214,6 +302,9 @@ cmd_disable() {
     if [[ -d "$redis_dir" ]]; then
         rm -rf "$redis_dir"
     fi
+
+    # Remove .user.ini session locking entries
+    remove_session_locking "$user"
 
     # Update state
     state_remove "$user"
