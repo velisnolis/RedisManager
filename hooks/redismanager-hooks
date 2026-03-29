@@ -1,0 +1,73 @@
+#!/bin/bash
+# RedisManager — cPanel hook handler
+# Installs to: /opt/redismanager/hooks/redismanager-hooks
+#
+# Registered hooks:
+#   Whostmgr::Accounts::Remove       (post) — cleanup on account deletion
+#   Whostmgr::Accounts::suspendacct  (post) — stop Redis on suspend
+#   Whostmgr::Accounts::unsuspendacct (post) — restart Redis on unsuspend
+set -euo pipefail
+
+CTL="/opt/redismanager/bin/redismanager-ctl"
+STATE="/var/lib/redismanager/state.json"
+LOG="/var/log/redismanager/hooks.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] HOOK: $*" >> "$LOG"
+}
+
+# cPanel hooks pass data via STDIN as JSON
+INPUT=$(cat)
+USERNAME=$(echo "$INPUT" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    # Different hook events pass username differently
+    user = data.get('user', data.get('username', ''))
+    print(user)
+except:
+    pass
+" 2>/dev/null)
+
+if [[ -z "$USERNAME" ]]; then
+    log "WARNING: Could not extract username from hook input"
+    exit 0
+fi
+
+# Check if this user is managed by us
+if ! python3 -c "
+import json, sys
+with open('$STATE') as f:
+    state = json.load(f)
+if '$USERNAME' not in state:
+    sys.exit(1)
+" 2>/dev/null; then
+    # User not managed, nothing to do
+    exit 0
+fi
+
+# Determine which hook called us based on the context variable
+CONTEXT="${CONTEXT:-}"
+HOOK_EVENT="${cp_hook_event:-unknown}"
+
+log "Processing hook=$HOOK_EVENT user=$USERNAME"
+
+case "$HOOK_EVENT" in
+    *Remove*|*killacct*)
+        log "Account removal detected for $USERNAME — disabling Redis"
+        "$CTL" disable "$USERNAME" >> "$LOG" 2>&1 || true
+        ;;
+    *suspend*)
+        log "Account suspended: $USERNAME — stopping Redis"
+        systemctl stop "redis-managed@${USERNAME}" 2>/dev/null || true
+        ;;
+    *unsuspend*)
+        log "Account unsuspended: $USERNAME — restarting Redis"
+        systemctl start "redis-managed@${USERNAME}" 2>/dev/null || true
+        ;;
+    *)
+        log "Unknown hook event: $HOOK_EVENT for $USERNAME"
+        ;;
+esac
+
+exit 0

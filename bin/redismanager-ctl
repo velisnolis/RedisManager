@@ -1,0 +1,429 @@
+#!/bin/bash
+# RedisManager — control script for per-user Redis instances
+# /opt/redismanager/bin/redismanager-ctl
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+CONF_FILE="${SCRIPT_DIR}/etc/redismanager.conf"
+TEMPLATE_FILE="${SCRIPT_DIR}/templates/redis-user.conf.tmpl"
+
+# Load configuration
+if [[ ! -f "$CONF_FILE" ]]; then
+    echo "ERROR: Config file not found: $CONF_FILE" >&2
+    exit 1
+fi
+# shellcheck source=/dev/null
+source "$CONF_FILE"
+
+# Ensure state directory exists
+STATE_DIR="$(dirname "$STATE_FILE")"
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+# Initialize state file if missing
+if [[ ! -f "$STATE_FILE" ]]; then
+    echo '{}' > "$STATE_FILE"
+fi
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_DIR}/redismanager.log"
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") <command> [arguments]
+
+Commands:
+  enable  <username> [memory_mb]  Enable Redis for a cPanel user
+  disable <username>              Disable Redis and clean up
+  restart <username>              Restart a user's Redis instance
+  status  <username>              Show status of a user's Redis instance
+  flush   <username>              Flush all data from a user's Redis
+  list                            List all managed users with status
+  info                            Show global resource usage
+  set-memory <username> <mb>      Change memory limit for a user
+
+EOF
+    exit 1
+}
+
+# --- State management ---
+
+state_get() {
+    local user="$1"
+    python3 -c "
+import json, sys
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+u = state.get('$user', {})
+if u:
+    print(f\"memory={u.get('memory_mb', $DEFAULT_MEMORY_MB)}\")
+    print(f\"enabled_at={u.get('enabled_at', 'unknown')}\")
+else:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+state_set() {
+    local user="$1" memory_mb="$2"
+    python3 -c "
+import json
+from datetime import datetime
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+state['$user'] = {
+    'memory_mb': $memory_mb,
+    'enabled_at': datetime.now().isoformat()
+}
+with open('$STATE_FILE', 'w') as f:
+    json.dump(state, f, indent=2)
+"
+}
+
+state_remove() {
+    local user="$1"
+    python3 -c "
+import json
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+state.pop('$user', None)
+with open('$STATE_FILE', 'w') as f:
+    json.dump(state, f, indent=2)
+"
+}
+
+state_total_memory() {
+    python3 -c "
+import json
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+total = sum(u.get('memory_mb', $DEFAULT_MEMORY_MB) for u in state.values())
+print(total)
+"
+}
+
+state_list_users() {
+    python3 -c "
+import json
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+for user, data in sorted(state.items()):
+    print(f\"{user} {data.get('memory_mb', $DEFAULT_MEMORY_MB)} {data.get('enabled_at', 'unknown')}\")
+"
+}
+
+# --- Validation ---
+
+validate_user() {
+    local user="$1"
+    if ! id "$user" &>/dev/null; then
+        echo "ERROR: User '$user' does not exist" >&2
+        exit 1
+    fi
+    if [[ ! -d "/home/$user" ]]; then
+        echo "ERROR: Home directory /home/$user not found" >&2
+        exit 1
+    fi
+}
+
+validate_binary() {
+    if [[ ! -x "$REDIS_BINARY" ]]; then
+        echo "ERROR: Redis binary not found or not executable: $REDIS_BINARY" >&2
+        echo "       Install alt-redis or update REDIS_BINARY in $CONF_FILE" >&2
+        exit 1
+    fi
+}
+
+check_budget() {
+    local requested="$1"
+    local current
+    current=$(state_total_memory)
+    local projected=$((current + requested))
+    if [[ $projected -gt $TOTAL_BUDGET_MB ]]; then
+        echo "ERROR: Memory budget exceeded. Current: ${current}MB, Requested: ${requested}MB, Budget: ${TOTAL_BUDGET_MB}MB" >&2
+        exit 1
+    fi
+}
+
+# --- Commands ---
+
+cmd_enable() {
+    local user="$1"
+    local memory_mb="${2:-$DEFAULT_MEMORY_MB}"
+
+    validate_user "$user"
+    validate_binary
+
+    # Check if already enabled
+    if state_get "$user" &>/dev/null; then
+        echo "WARN: Redis already enabled for '$user'. Use 'restart' or 'set-memory'." >&2
+        exit 1
+    fi
+
+    # Check budget
+    check_budget "$memory_mb"
+
+    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    local conf_file="${redis_dir}/redis.conf"
+
+    # Create directory
+    mkdir -p "$redis_dir"
+
+    # Generate config from template
+    sed -e "s|{{USERNAME}}|${user}|g" \
+        -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
+        "$TEMPLATE_FILE" > "$conf_file"
+
+    # Set permissions
+    chown -R "${user}:${user}" "$redis_dir"
+    chmod 750 "$redis_dir"
+    chmod 640 "$conf_file"
+
+    # Enable and start systemd service
+    systemctl enable "redis-managed@${user}" --quiet 2>/dev/null
+    systemctl start "redis-managed@${user}"
+
+    # Update state
+    state_set "$user" "$memory_mb"
+
+    log "ENABLED Redis for user=$user memory=${memory_mb}MB"
+
+    # Show connection info
+    echo "Redis enabled for '$user'"
+    echo ""
+    echo "Joomla configuration:"
+    echo "  Cache Handler:    Redis"
+    echo "  Redis Host:       ${redis_dir}/redis.sock"
+    echo "  Redis Port:       6379  (default, ignored when using socket)"
+    echo "  Redis Database:   0  (cache)"
+    echo ""
+    echo "  Session Handler:  Redis"
+    echo "  Session Host:     ${redis_dir}/redis.sock"
+    echo "  Session Port:     6379  (default, ignored when using socket)"
+    echo "  Session Database: 1  (sessions)"
+}
+
+cmd_disable() {
+    local user="$1"
+
+    # Stop and disable systemd service (don't fail if not running)
+    systemctl stop "redis-managed@${user}" 2>/dev/null || true
+    systemctl disable "redis-managed@${user}" --quiet 2>/dev/null || true
+
+    # Remove data directory
+    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    if [[ -d "$redis_dir" ]]; then
+        rm -rf "$redis_dir"
+    fi
+
+    # Update state
+    state_remove "$user"
+
+    log "DISABLED Redis for user=$user"
+    echo "Redis disabled for '$user'"
+}
+
+cmd_restart() {
+    local user="$1"
+
+    if ! state_get "$user" &>/dev/null; then
+        echo "ERROR: Redis not enabled for '$user'" >&2
+        exit 1
+    fi
+
+    systemctl restart "redis-managed@${user}"
+    log "RESTARTED Redis for user=$user"
+    echo "Redis restarted for '$user'"
+}
+
+cmd_status() {
+    local user="$1"
+    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    local socket="${redis_dir}/${SOCKET_NAME}"
+
+    echo "=== Redis Status for '$user' ==="
+
+    # State info
+    if state_get "$user" &>/dev/null; then
+        eval "$(state_get "$user")"
+        echo "State:      enabled"
+        echo "Memory:     ${memory}MB"
+        echo "Enabled at: ${enabled_at}"
+    else
+        echo "State:      not managed"
+        return
+    fi
+
+    # Systemd status
+    if systemctl is-active --quiet "redis-managed@${user}" 2>/dev/null; then
+        echo "Service:    active"
+    else
+        echo "Service:    inactive"
+    fi
+
+    # Socket check
+    if [[ -S "$socket" ]]; then
+        echo "Socket:     ${socket} (exists)"
+    else
+        echo "Socket:     ${socket} (MISSING)"
+        return
+    fi
+
+    # Redis info via CLI
+    if [[ -x "$REDIS_CLI" ]]; then
+        local info
+        info=$("$REDIS_CLI" -s "$socket" INFO memory 2>/dev/null | grep -E 'used_memory_human|maxmemory_human' || true)
+        if [[ -n "$info" ]]; then
+            echo ""
+            echo "$info"
+        fi
+    fi
+}
+
+cmd_flush() {
+    local user="$1"
+    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    local socket="${redis_dir}/${SOCKET_NAME}"
+
+    if [[ ! -S "$socket" ]]; then
+        echo "ERROR: Socket not found: $socket" >&2
+        exit 1
+    fi
+
+    "$REDIS_CLI" -s "$socket" FLUSHALL >/dev/null
+    log "FLUSHED Redis for user=$user"
+    echo "Redis flushed for '$user'"
+}
+
+cmd_set_memory() {
+    local user="$1"
+    local memory_mb="$2"
+
+    if ! state_get "$user" &>/dev/null; then
+        echo "ERROR: Redis not enabled for '$user'" >&2
+        exit 1
+    fi
+
+    validate_user "$user"
+
+    # Check budget (subtract current allocation, add new)
+    local current_state
+    eval "$(state_get "$user")"
+    local current_alloc="${memory}"
+    local delta=$((memory_mb - current_alloc))
+    if [[ $delta -gt 0 ]]; then
+        check_budget "$delta"
+    fi
+
+    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    local conf_file="${redis_dir}/redis.conf"
+
+    # Regenerate config
+    sed -e "s|{{USERNAME}}|${user}|g" \
+        -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
+        "$TEMPLATE_FILE" > "$conf_file"
+
+    chown "${user}:${user}" "$conf_file"
+    chmod 640 "$conf_file"
+
+    # Update state and restart
+    state_set "$user" "$memory_mb"
+    systemctl restart "redis-managed@${user}"
+
+    log "SET-MEMORY Redis for user=$user to ${memory_mb}MB"
+    echo "Memory limit for '$user' set to ${memory_mb}MB and restarted"
+}
+
+cmd_list() {
+    local total_memory
+    total_memory=$(state_total_memory)
+    local count=0
+
+    printf "%-20s %-8s %-8s %-20s %s\n" "USER" "MEMORY" "STATUS" "ENABLED AT" "SOCKET"
+    printf "%-20s %-8s %-8s %-20s %s\n" "----" "------" "------" "----------" "------"
+
+    while IFS=' ' read -r user mem enabled_at; do
+        [[ -z "$user" ]] && continue
+        count=$((count + 1))
+
+        local status="inactive"
+        if systemctl is-active --quiet "redis-managed@${user}" 2>/dev/null; then
+            status="active"
+        fi
+
+        local socket="/home/${user}/${USER_REDIS_DIR}/${SOCKET_NAME}"
+        printf "%-20s %-8s %-8s %-20s %s\n" "$user" "${mem}MB" "$status" "$enabled_at" "$socket"
+    done < <(state_list_users)
+
+    echo ""
+    echo "Total: ${count} instances, ${total_memory}MB / ${TOTAL_BUDGET_MB}MB budget"
+}
+
+cmd_info() {
+    local total_memory
+    total_memory=$(state_total_memory)
+    local count
+    count=$(state_list_users | wc -l)
+
+    echo "=== RedisManager Info ==="
+    echo "Binary:       $REDIS_BINARY"
+    if [[ -x "$REDIS_BINARY" ]]; then
+        echo "Version:      $("$REDIS_BINARY" --version 2>/dev/null | awk '{print $3}' | cut -d= -f2)"
+    else
+        echo "Version:      BINARY NOT FOUND"
+    fi
+    echo "Instances:    ${count}"
+    echo "Memory used:  ${total_memory}MB / ${TOTAL_BUDGET_MB}MB"
+    echo "State file:   $STATE_FILE"
+    echo "CageFS:       $USE_CAGEFS"
+    echo ""
+
+    # Show system memory
+    echo "=== System Memory ==="
+    free -m | head -2
+}
+
+# --- Main ---
+
+if [[ $# -lt 1 ]]; then
+    usage
+fi
+
+CMD="$1"
+shift
+
+case "$CMD" in
+    enable)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") enable <username> [memory_mb]"; exit 1; }
+        cmd_enable "$@"
+        ;;
+    disable)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") disable <username>"; exit 1; }
+        cmd_disable "$@"
+        ;;
+    restart)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") restart <username>"; exit 1; }
+        cmd_restart "$@"
+        ;;
+    status)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") status <username>"; exit 1; }
+        cmd_status "$@"
+        ;;
+    flush)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") flush <username>"; exit 1; }
+        cmd_flush "$@"
+        ;;
+    list)
+        cmd_list
+        ;;
+    info)
+        cmd_info
+        ;;
+    set-memory)
+        [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") set-memory <username> <mb>"; exit 1; }
+        cmd_set_memory "$@"
+        ;;
+    *)
+        echo "Unknown command: $CMD" >&2
+        usage
+        ;;
+esac

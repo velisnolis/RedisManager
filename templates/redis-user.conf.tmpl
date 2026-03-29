@@ -1,0 +1,27 @@
+# RedisManager — auto-generated config for {{USERNAME}}
+# Do not edit manually — changes will be overwritten on restart/reconfigure
+
+# Network: socket-only, no TCP
+bind 127.0.0.1
+port 0
+unixsocket /home/{{USERNAME}}/.redis-managed/redis.sock
+unixsocketperm 600
+
+# Limits
+maxclients 16
+maxmemory {{MAXMEMORY}}mb
+maxmemory-policy allkeys-lru
+databases 2
+
+# Persistence: disabled (pure cache mode)
+save ""
+appendonly no
+
+# Process
+daemonize no
+pidfile /home/{{USERNAME}}/.redis-managed/redis.pid
+dir /home/{{USERNAME}}/.redis-managed
+
+# Logging
+loglevel warning
+logfile /home/{{USERNAME}}/.redis-managed/redis.log

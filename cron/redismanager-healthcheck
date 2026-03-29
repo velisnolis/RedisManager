@@ -1,0 +1,68 @@
+#!/bin/bash
+# RedisManager — health check cron
+# Installs to: /opt/redismanager/cron/redismanager-healthcheck
+# Cron: */5 * * * * root /opt/redismanager/cron/redismanager-healthcheck
+set -euo pipefail
+
+CONF="/opt/redismanager/etc/redismanager.conf"
+# shellcheck source=/dev/null
+source "$CONF"
+
+LOG="${LOG_DIR}/healthcheck.log"
+ALERT_THRESHOLD=90  # percentage of budget
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] HEALTH: $*" >> "$LOG"
+}
+
+# Read state
+if [[ ! -f "$STATE_FILE" ]]; then
+    exit 0
+fi
+
+USERS=$(python3 -c "
+import json
+with open('$STATE_FILE') as f:
+    state = json.load(f)
+for user, data in state.items():
+    print(f\"{user} {data.get('memory_mb', $DEFAULT_MEMORY_MB)}\")
+" 2>/dev/null)
+
+if [[ -z "$USERS" ]]; then
+    exit 0
+fi
+
+TOTAL_MEM=0
+ACTIVE=0
+RESTARTED=0
+FAILED=0
+
+while IFS=' ' read -r user mem; do
+    [[ -z "$user" ]] && continue
+    TOTAL_MEM=$((TOTAL_MEM + mem))
+
+    if systemctl is-active --quiet "redis-managed@${user}" 2>/dev/null; then
+        ACTIVE=$((ACTIVE + 1))
+    else
+        # Try to restart
+        log "Instance for $user is DOWN — attempting restart"
+        if systemctl start "redis-managed@${user}" 2>/dev/null; then
+            RESTARTED=$((RESTARTED + 1))
+            log "Successfully restarted Redis for $user"
+        else
+            FAILED=$((FAILED + 1))
+            log "FAILED to restart Redis for $user"
+        fi
+    fi
+done <<< "$USERS"
+
+# Budget check
+USAGE_PCT=$((TOTAL_MEM * 100 / TOTAL_BUDGET_MB))
+if [[ $USAGE_PCT -ge $ALERT_THRESHOLD ]]; then
+    log "WARNING: Memory usage at ${USAGE_PCT}% of budget (${TOTAL_MEM}MB / ${TOTAL_BUDGET_MB}MB)"
+fi
+
+# Only log summary if something happened
+if [[ $RESTARTED -gt 0 || $FAILED -gt 0 ]]; then
+    log "Summary: active=$ACTIVE restarted=$RESTARTED failed=$FAILED memory=${TOTAL_MEM}MB/${TOTAL_BUDGET_MB}MB"
+fi

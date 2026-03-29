@@ -1,0 +1,25 @@
+# /etc/systemd/system/redis-managed@.service
+# RedisManager — per-user Redis instance template
+# Installs to: /etc/systemd/system/redis-managed@.service
+
+[Unit]
+Description=Redis Managed Instance for %i
+After=network.target cagefs.service lve_namespaces.service
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+ExecStartPre=-/bin/mkdir -p /home/%i/.redis-managed
+ExecStart=/bin/cagefs_enter.proxied /opt/alt/redis/bin/redis-server /home/%i/.redis-managed/redis.conf
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=10
+TimeoutStopSec=10
+LimitNOFILE=10240
+
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target
