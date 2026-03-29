@@ -8,7 +8,7 @@ unixsocket /home/{{USERNAME}}/.redis-managed/redis.sock
 unixsocketperm 600
 
 # Limits
-maxclients 16
+maxclients {{MAXCLIENTS}}
 maxmemory {{MAXMEMORY}}mb
 maxmemory-policy allkeys-lru
 databases 2

@@ -113,6 +113,9 @@ redismanager-ctl flush <username>
 # Change memory limit
 redismanager-ctl set-memory <username> <mb>
 
+# Change max client connections (default 128, range 8-1024)
+redismanager-ctl set-maxclients <username> <n>
+
 # Show global info (binary version, memory budget, etc.)
 redismanager-ctl info
 ```
@@ -220,6 +223,7 @@ Global settings are in `/opt/redismanager/etc/redismanager.conf`:
 |---|---|---|
 | `REDIS_BINARY` | `/opt/alt/redis/bin/redis-server` | Path to Redis/Valkey binary |
 | `DEFAULT_MEMORY_MB` | `64` | Default maxmemory per instance |
+| `DEFAULT_MAXCLIENTS` | `128` | Default max connections per instance |
 | `TOTAL_BUDGET_MB` | `2048` | Total memory budget across all instances |
 | `USE_CAGEFS` | `true` | Launch Redis inside CageFS |
 

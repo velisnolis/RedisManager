@@ -41,6 +41,7 @@ Commands:
   list                            List all managed users with status
   info                            Show global resource usage
   set-memory <username> <mb>      Change memory limit for a user
+  set-maxclients <username> <n>   Change max connections for a user
 
 EOF
     exit 1
@@ -57,6 +58,7 @@ with open('$STATE_FILE') as f:
 u = state.get('$user', {})
 if u:
     print(f\"memory={u.get('memory_mb', $DEFAULT_MEMORY_MB)}\")
+    print(f\"maxclients={u.get('maxclients', $DEFAULT_MAXCLIENTS)}\")
     print(f\"enabled_at={u.get('enabled_at', 'unknown')}\")
 else:
     sys.exit(1)
@@ -64,15 +66,17 @@ else:
 }
 
 state_set() {
-    local user="$1" memory_mb="$2"
+    local user="$1" memory_mb="$2" maxclients="${3:-$DEFAULT_MAXCLIENTS}"
     python3 -c "
 import json
 from datetime import datetime
 with open('$STATE_FILE') as f:
     state = json.load(f)
+existing = state.get('$user', {})
 state['$user'] = {
     'memory_mb': $memory_mb,
-    'enabled_at': datetime.now().isoformat()
+    'maxclients': $maxclients,
+    'enabled_at': existing.get('enabled_at', datetime.now().isoformat())
 }
 with open('$STATE_FILE', 'w') as f:
     json.dump(state, f, indent=2)
@@ -229,6 +233,22 @@ remove_session_locking() {
     done < <(find "$homedir" -name ".user.ini" -exec grep -lF "$USERINI_MARKER_BEGIN" {} + 2>/dev/null || true)
 }
 
+# --- Helpers ---
+
+regenerate_config() {
+    local user="$1" memory_mb="$2" mc="$3"
+    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    local conf_file="${redis_dir}/redis.conf"
+
+    sed -e "s|{{USERNAME}}|${user}|g" \
+        -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
+        -e "s|{{MAXCLIENTS}}|${mc}|g" \
+        "$TEMPLATE_FILE" > "$conf_file"
+
+    chown "${user}:${user}" "$conf_file"
+    chmod 640 "$conf_file"
+}
+
 # --- Commands ---
 
 cmd_enable() {
@@ -253,22 +273,21 @@ cmd_enable() {
     # Create directory
     mkdir -p "$redis_dir"
 
+    local maxclients="${DEFAULT_MAXCLIENTS}"
+
     # Generate config from template
-    sed -e "s|{{USERNAME}}|${user}|g" \
-        -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
-        "$TEMPLATE_FILE" > "$conf_file"
+    regenerate_config "$user" "$memory_mb" "$maxclients"
 
     # Set permissions
     chown -R "${user}:${user}" "$redis_dir"
     chmod 750 "$redis_dir"
-    chmod 640 "$conf_file"
 
     # Enable and start systemd service
     systemctl enable "redis-managed@${user}" --quiet 2>/dev/null
     systemctl start "redis-managed@${user}"
 
     # Update state
-    state_set "$user" "$memory_mb"
+    state_set "$user" "$memory_mb" "$maxclients"
 
     # Deploy .user.ini with Redis session locking for all document roots
     deploy_session_locking "$user"
@@ -338,6 +357,7 @@ cmd_status() {
         eval "$(state_get "$user")"
         echo "State:      enabled"
         echo "Memory:     ${memory}MB"
+        echo "Maxclients: ${maxclients}"
         echo "Enabled at: ${enabled_at}"
     else
         echo "State:      not managed"
@@ -397,31 +417,51 @@ cmd_set_memory() {
     validate_user "$user"
 
     # Check budget (subtract current allocation, add new)
-    local current_state
     eval "$(state_get "$user")"
     local current_alloc="${memory}"
+    local current_maxclients="${maxclients:-$DEFAULT_MAXCLIENTS}"
     local delta=$((memory_mb - current_alloc))
     if [[ $delta -gt 0 ]]; then
         check_budget "$delta"
     fi
 
-    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
-    local conf_file="${redis_dir}/redis.conf"
-
-    # Regenerate config
-    sed -e "s|{{USERNAME}}|${user}|g" \
-        -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
-        "$TEMPLATE_FILE" > "$conf_file"
-
-    chown "${user}:${user}" "$conf_file"
-    chmod 640 "$conf_file"
+    regenerate_config "$user" "$memory_mb" "$current_maxclients"
 
     # Update state and restart
-    state_set "$user" "$memory_mb"
+    state_set "$user" "$memory_mb" "$current_maxclients"
     systemctl restart "redis-managed@${user}"
 
     log "SET-MEMORY Redis for user=$user to ${memory_mb}MB"
     echo "Memory limit for '$user' set to ${memory_mb}MB and restarted"
+}
+
+cmd_set_maxclients() {
+    local user="$1"
+    local new_maxclients="$2"
+
+    if ! state_get "$user" &>/dev/null; then
+        echo "ERROR: Redis not enabled for '$user'" >&2
+        exit 1
+    fi
+
+    validate_user "$user"
+
+    if [[ ! "$new_maxclients" =~ ^[0-9]+$ ]] || [[ "$new_maxclients" -lt 8 ]] || [[ "$new_maxclients" -gt 1024 ]]; then
+        echo "ERROR: maxclients must be between 8 and 1024" >&2
+        exit 1
+    fi
+
+    eval "$(state_get "$user")"
+    local current_memory="${memory}"
+
+    regenerate_config "$user" "$current_memory" "$new_maxclients"
+
+    # Update state and restart
+    state_set "$user" "$current_memory" "$new_maxclients"
+    systemctl restart "redis-managed@${user}"
+
+    log "SET-MAXCLIENTS Redis for user=$user to ${new_maxclients}"
+    echo "Max clients for '$user' set to ${new_maxclients} and restarted"
 }
 
 cmd_list() {
@@ -512,6 +552,10 @@ case "$CMD" in
     set-memory)
         [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") set-memory <username> <mb>"; exit 1; }
         cmd_set_memory "$@"
+        ;;
+    set-maxclients)
+        [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") set-maxclients <username> <n>"; exit 1; }
+        cmd_set_maxclients "$@"
         ;;
     *)
         echo "Unknown command: $CMD" >&2
