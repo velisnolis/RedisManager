@@ -8,6 +8,10 @@
 
 Built primarily for **Joomla** sites that can't use AccelerateWP, but works for any application that supports Redis via Unix sockets.
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="RedisManager WHM interface" width="800">
+</p>
+
 ## What it does
 
 - Creates **isolated Redis instances per cPanel user**, each running under the user's UID inside CageFS
@@ -39,7 +43,15 @@ Built primarily for **Joomla** sites that can't use AccelerateWP, but works for 
 
 ## Installation
 
-1. Clone the repository or download a release:
+### Quick install (one-liner)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/velisnolis/RedisManager/main/install-remote.sh | bash
+```
+
+### Manual install
+
+1. Clone the repository:
 
 ```bash
 git clone https://github.com/velisnolis/RedisManager.git /tmp/redismanager
