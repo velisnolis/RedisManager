@@ -65,13 +65,13 @@ case "$HOOK_EVENT" in
         log "Account removal detected for $USERNAME — disabling Redis"
         "$CTL" disable "$USERNAME" >> "$LOG" 2>&1 || true
         ;;
-    *suspend*)
-        log "Account suspended: $USERNAME — stopping Redis"
-        systemctl stop "redis-managed@${USERNAME}" 2>/dev/null || true
-        ;;
     *unsuspend*)
         log "Account unsuspended: $USERNAME — restarting Redis"
         systemctl start "redis-managed@${USERNAME}" 2>/dev/null || true
+        ;;
+    *suspend*)
+        log "Account suspended: $USERNAME — stopping Redis"
+        systemctl stop "redis-managed@${USERNAME}" 2>/dev/null || true
         ;;
     *)
         log "Unknown hook event: $HOOK_EVENT for $USERNAME"
