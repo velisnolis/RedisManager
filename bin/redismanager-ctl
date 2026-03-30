@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 CONF_FILE="${SCRIPT_DIR}/etc/redismanager.conf"
 TEMPLATE_FILE="${SCRIPT_DIR}/templates/redis-user.conf.tmpl"
+LOCK_FILE="/var/run/redismanager-state.lock"
 
 # Load configuration
 if [[ ! -f "$CONF_FILE" ]]; then
@@ -23,6 +24,19 @@ mkdir -p "$STATE_DIR" "$LOG_DIR"
 if [[ ! -f "$STATE_FILE" ]]; then
     echo '{}' > "$STATE_FILE"
 fi
+
+# --- Username validation ---
+# cPanel usernames: lowercase, starts with letter, max 16 chars on most setups,
+# we allow up to 30 for flexibility. Same regex the WHM CGI uses.
+VALID_USER_RE='^[a-z][a-z0-9_]{0,30}$'
+
+validate_username_format() {
+    local user="$1"
+    if [[ ! "$user" =~ $VALID_USER_RE ]]; then
+        echo "ERROR: Invalid username format '$user'. Must match: $VALID_USER_RE" >&2
+        exit 1
+    fi
+}
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "${LOG_DIR}/redismanager.log"
@@ -48,10 +62,12 @@ EOF
 }
 
 # --- State management ---
+# All state operations use flock to prevent concurrent corruption.
+# The state file (state.json) is shared between CLI, WHM CGI, cron, and hooks.
 
 state_get() {
     local user="$1"
-    python3 -c "
+    flock -s "$LOCK_FILE" python3 -c "
 import json, sys
 with open('$STATE_FILE') as f:
     state = json.load(f)
@@ -67,8 +83,8 @@ else:
 
 state_set() {
     local user="$1" memory_mb="$2" maxclients="${3:-$DEFAULT_MAXCLIENTS}"
-    python3 -c "
-import json
+    flock "$LOCK_FILE" python3 -c "
+import json, os, tempfile
 from datetime import datetime
 with open('$STATE_FILE') as f:
     state = json.load(f)
@@ -78,25 +94,30 @@ state['$user'] = {
     'maxclients': $maxclients,
     'enabled_at': existing.get('enabled_at', datetime.now().isoformat())
 }
-with open('$STATE_FILE', 'w') as f:
+# Atomic write: temp file + rename avoids partial writes
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname('$STATE_FILE'))
+with os.fdopen(fd, 'w') as f:
     json.dump(state, f, indent=2)
+os.rename(tmp, '$STATE_FILE')
 "
 }
 
 state_remove() {
     local user="$1"
-    python3 -c "
-import json
+    flock "$LOCK_FILE" python3 -c "
+import json, os, tempfile
 with open('$STATE_FILE') as f:
     state = json.load(f)
 state.pop('$user', None)
-with open('$STATE_FILE', 'w') as f:
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname('$STATE_FILE'))
+with os.fdopen(fd, 'w') as f:
     json.dump(state, f, indent=2)
+os.rename(tmp, '$STATE_FILE')
 "
 }
 
 state_total_memory() {
-    python3 -c "
+    flock -s "$LOCK_FILE" python3 -c "
 import json
 with open('$STATE_FILE') as f:
     state = json.load(f)
@@ -106,7 +127,7 @@ print(total)
 }
 
 state_list_users() {
-    python3 -c "
+    flock -s "$LOCK_FILE" python3 -c "
 import json
 with open('$STATE_FILE') as f:
     state = json.load(f)
@@ -119,6 +140,7 @@ for user, data in sorted(state.items()):
 
 validate_user() {
     local user="$1"
+    validate_username_format "$user"
     if ! id "$user" &>/dev/null; then
         echo "ERROR: User '$user' does not exist" >&2
         exit 1
@@ -149,6 +171,25 @@ check_budget() {
 }
 
 # --- Session locking ---
+#
+# Why: PHP's phpredis extension does NOT enable session locking by default.
+# Without it, concurrent requests (common in Joomla admin AJAX) read the same
+# session simultaneously, causing race conditions — symptoms include random 500
+# errors, lost form data, and "poltergeist" behavior where settings appear to
+# reset themselves.
+#
+# What we deploy: a .user.ini file in each document root with these settings:
+#   redis.session.locking_enabled = 1   — serialize session access
+#   redis.session.lock_retries = 300    — retry up to 300 times (3 sec total)
+#   redis.session.lock_wait_time = 10000 — 10ms between retries
+#
+# Why .user.ini: on cPanel with PHP-FPM / LSAPI, per-directory .user.ini is
+# the standard way to override PHP settings without touching the global php.ini
+# or per-vhost configs managed by cPanel. It's re-read every
+# user_ini.cache_ttl seconds (default 300).
+#
+# Cleanup: on disable, we remove only our marked block from .user.ini — if the
+# file contained other settings, they are preserved.
 
 USERINI_MARKER_BEGIN="; >>> RedisManager session locking — do not edit"
 USERINI_MARKER_END="; <<< RedisManager"
@@ -311,6 +352,7 @@ cmd_enable() {
 
 cmd_disable() {
     local user="$1"
+    validate_username_format "$user"
 
     # Stop and disable systemd service (don't fail if not running)
     systemctl stop "redis-managed@${user}" 2>/dev/null || true
@@ -334,6 +376,7 @@ cmd_disable() {
 
 cmd_restart() {
     local user="$1"
+    validate_username_format "$user"
 
     if ! state_get "$user" &>/dev/null; then
         echo "ERROR: Redis not enabled for '$user'" >&2
@@ -347,6 +390,7 @@ cmd_restart() {
 
 cmd_status() {
     local user="$1"
+    validate_username_format "$user"
     local redis_dir="/home/${user}/${USER_REDIS_DIR}"
     local socket="${redis_dir}/${SOCKET_NAME}"
 
@@ -392,6 +436,7 @@ cmd_status() {
 
 cmd_flush() {
     local user="$1"
+    validate_username_format "$user"
     local redis_dir="/home/${user}/${USER_REDIS_DIR}"
     local socket="${redis_dir}/${SOCKET_NAME}"
 
@@ -469,8 +514,8 @@ cmd_list() {
     total_memory=$(state_total_memory)
     local count=0
 
-    printf "%-20s %-8s %-8s %-20s %s\n" "USER" "MEMORY" "STATUS" "ENABLED AT" "SOCKET"
-    printf "%-20s %-8s %-8s %-20s %s\n" "----" "------" "------" "----------" "------"
+    printf "%-20s %-8s %-10s %-8s %-20s %s\n" "USER" "MEMORY" "MAXCLIENT" "STATUS" "ENABLED AT" "SOCKET"
+    printf "%-20s %-8s %-10s %-8s %-20s %s\n" "----" "------" "---------" "------" "----------" "------"
 
     while IFS=' ' read -r user mem enabled_at; do
         [[ -z "$user" ]] && continue
@@ -481,8 +526,15 @@ cmd_list() {
             status="active"
         fi
 
+        # Get maxclients from state
+        local mc="$DEFAULT_MAXCLIENTS"
+        if state_get "$user" &>/dev/null; then
+            eval "$(state_get "$user")"
+            mc="${maxclients:-$DEFAULT_MAXCLIENTS}"
+        fi
+
         local socket="/home/${user}/${USER_REDIS_DIR}/${SOCKET_NAME}"
-        printf "%-20s %-8s %-8s %-20s %s\n" "$user" "${mem}MB" "$status" "$enabled_at" "$socket"
+        printf "%-20s %-8s %-10s %-8s %-20s %s\n" "$user" "${mem}MB" "$mc" "$status" "$enabled_at" "$socket"
     done < <(state_list_users)
 
     echo ""
@@ -504,6 +556,7 @@ cmd_info() {
     fi
     echo "Instances:    ${count}"
     echo "Memory used:  ${total_memory}MB / ${TOTAL_BUDGET_MB}MB"
+    echo "Maxclients:   $DEFAULT_MAXCLIENTS (default)"
     echo "State file:   $STATE_FILE"
     echo "CageFS:       $USE_CAGEFS"
     echo ""

@@ -9,18 +9,19 @@ CONF="/opt/redismanager/etc/redismanager.conf"
 source "$CONF"
 
 LOG="${LOG_DIR}/healthcheck.log"
+LOCK_FILE="/var/run/redismanager-state.lock"
 ALERT_THRESHOLD=90  # percentage of budget
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] HEALTH: $*" >> "$LOG"
 }
 
-# Read state
+# Read state (shared lock — doesn't block other readers)
 if [[ ! -f "$STATE_FILE" ]]; then
     exit 0
 fi
 
-USERS=$(python3 -c "
+USERS=$(flock -s "$LOCK_FILE" python3 -c "
 import json
 with open('$STATE_FILE') as f:
     state = json.load(f)

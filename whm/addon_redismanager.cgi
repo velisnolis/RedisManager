@@ -17,7 +17,7 @@ use JSON::PP;
 my $CTL       = '/opt/redismanager/bin/redismanager-ctl';
 my $STATE     = '/var/lib/redismanager/state.json';
 my $CONF_FILE = '/opt/redismanager/etc/redismanager.conf';
-my $VERSION   = '0.2.0';
+my $VERSION   = '0.3.0';
 
 # --- WHM Auth ---
 Whostmgr::ACLS::init_acls();
@@ -27,24 +27,19 @@ if (!Whostmgr::ACLS::hasroot()) {
     exit;
 }
 
-# --- Parse form ---
+# --- Parse form (single CGI instance — reused everywhere) ---
 my $cgi = CGI->new;
 my $action      = $cgi->param('action')      // '';
 my $username    = $cgi->param('username')    // '';
 my $memory      = $cgi->param('memory')      // '';
 my $maxclients  = $cgi->param('maxclients')  // '';
 
-# Global config params
-my $cfg_default_memory    = $cgi->param('cfg_default_memory')    // '';
-my $cfg_default_maxclients = $cgi->param('cfg_default_maxclients') // '';
-my $cfg_total_budget      = $cgi->param('cfg_total_budget')      // '';
-
 # --- Handle POST actions ---
 my $message  = '';
 my $msg_type = '';
 
 if ($ENV{'REQUEST_METHOD'} eq 'POST' && $action) {
-    ($message, $msg_type) = handle_action($action, $username, $memory, $maxclients);
+    ($message, $msg_type) = handle_action($cgi, $action, $username, $memory, $maxclients);
 }
 
 # --- Get data ---
@@ -69,12 +64,26 @@ exit;
 # Functions
 # =========================================================================
 
-sub handle_action {
-    my ($act, $user, $mem, $mc) = @_;
+# Simple HTML entity escaping for output safety.
+# WHM is root-only so XSS risk is minimal, but it's good practice to escape
+# any data that could theoretically contain HTML characters (error messages,
+# domain names from whmapi, etc.).
+sub html_escape {
+    my ($str) = @_;
+    return '' unless defined $str;
+    $str =~ s/&/&amp;/g;
+    $str =~ s/</&lt;/g;
+    $str =~ s/>/&gt;/g;
+    $str =~ s/"/&quot;/g;
+    return $str;
+}
 
-    # Global config save — no user needed
+sub handle_action {
+    my ($cgi_obj, $act, $user, $mem, $mc) = @_;
+
+    # Global config save — no user needed, params read from the shared $cgi_obj
     if ($act eq 'save-config') {
-        return save_global_config();
+        return save_global_config($cgi_obj);
     }
 
     return ('', '') unless $user && $user =~ /^[a-z][a-z0-9_]{0,30}$/;
@@ -104,15 +113,17 @@ sub handle_action {
         return ("OK: $act for $user", 'success');
     } else {
         chomp $output;
-        return ("Error: $output", 'error');
+        return ("Error: " . html_escape($output), 'error');
     }
 }
 
 sub save_global_config {
-    my $cgi = CGI->new;
-    my $new_mem = $cgi->param('cfg_default_memory')     // '';
-    my $new_mc  = $cgi->param('cfg_default_maxclients')  // '';
-    my $new_bud = $cgi->param('cfg_total_budget')        // '';
+    my ($cgi_obj) = @_;
+
+    # Read params from the SAME CGI instance (POST body is already consumed)
+    my $new_mem = $cgi_obj->param('cfg_default_memory')     // '';
+    my $new_mc  = $cgi_obj->param('cfg_default_maxclients')  // '';
+    my $new_bud = $cgi_obj->param('cfg_total_budget')        // '';
 
     # Validate
     if ($new_mem && !($new_mem =~ /^\d+$/ && $new_mem >= 16 && $new_mem <= 1024)) {
@@ -223,22 +234,6 @@ sub is_service_active {
     return $? == 0;
 }
 
-sub get_redis_info {
-    my ($user) = @_;
-    my $socket = "/home/$user/.redis-managed/redis.sock";
-    my $cli = $conf{'REDIS_CLI'} // '/opt/alt/redis/bin/redis-cli';
-    my %rinfo;
-    my $output = `$cli -s '$socket' INFO 2>/dev/null`;
-    if ($output) {
-        for my $line (split /\r?\n/, $output) {
-            if ($line =~ /^(\w+):(.+)/) {
-                $rinfo{$1} = $2;
-            }
-        }
-    }
-    return %rinfo;
-}
-
 sub print_page {
     my ($accounts, $state, $info, $conf, $msg, $msg_type) = @_;
 
@@ -254,8 +249,8 @@ sub print_page {
     my $security_token = $ENV{'cp_security_token'} || '';
     my $form_action = "${security_token}/cgi/addon_redismanager.cgi";
 
-    my $binary  = $info->{binary}  // $conf->{REDIS_BINARY} // '/opt/alt/redis/bin/redis-server';
-    my $version = $info->{version} // 'N/A';
+    my $binary  = html_escape($info->{binary}  // $conf->{REDIS_BINARY} // '/opt/alt/redis/bin/redis-server');
+    my $version = html_escape($info->{version} // 'N/A');
 
     my $default_mem = $conf->{DEFAULT_MEMORY_MB} // 64;
     my $default_mc  = $conf->{DEFAULT_MAXCLIENTS} // 128;
@@ -316,12 +311,13 @@ function rmConfirm(action, user) {
 <div class="body-content">
 HTML
 
-    # Message banner
+    # Message banner (escaped)
     if ($msg) {
+        my $escaped_msg = html_escape($msg);
         if ($msg_type eq 'success') {
-            print qq{<div style="padding:12px 16px;margin-bottom:15px;border-left:4px solid #3c763d;background:#dff0d8;color:#3c763d;font-size:14px;border-radius:3px"><strong>&#10004;</strong> $msg</div>\n};
+            print qq{<div style="padding:12px 16px;margin-bottom:15px;border-left:4px solid #3c763d;background:#dff0d8;color:#3c763d;font-size:14px;border-radius:3px"><strong>&#10004;</strong> $escaped_msg</div>\n};
         } else {
-            print qq{<div style="padding:12px 16px;margin-bottom:15px;border-left:4px solid #a94442;background:#f2dede;color:#a94442;font-size:14px;border-radius:3px"><strong>&#10008;</strong> $msg</div>\n};
+            print qq{<div style="padding:12px 16px;margin-bottom:15px;border-left:4px solid #a94442;background:#f2dede;color:#a94442;font-size:14px;border-radius:3px"><strong>&#10008;</strong> $escaped_msg</div>\n};
         }
     }
 
@@ -385,6 +381,8 @@ HTML
     my $row = 0;
     for my $acct (@$accounts) {
         my $user = $acct->{user};
+        my $domain = html_escape($acct->{domain});
+        my $plan   = html_escape($acct->{plan});
         my $is_managed = exists $state->{$user};
         my $mem_mb = $is_managed ? ($state->{$user}{memory_mb} // 64) : $default_mem;
         my $mc_val = $is_managed ? ($state->{$user}{maxclients} // $default_mc) : $default_mc;
@@ -427,9 +425,9 @@ HTML
         }
 
         print qq{$toggle_td};
-        print qq{<td class="$shade"><b>$acct->{domain}</b></td>};
+        print qq{<td class="$shade"><b>$domain</b></td>};
         print qq{<td class="$shade">$user</td>};
-        print qq{<td class="$shade" style="text-align:center">$acct->{plan}</td>};
+        print qq{<td class="$shade" style="text-align:center">$plan</td>};
         print qq{<td class="$shade" style="text-align:center">$status_badge</td>};
         print qq{<td class="$shade" style="text-align:center">@{[$is_managed ? "${mem_mb}MB" : '-']}</td>};
         print qq{<td class="$shade" style="text-align:center">@{[$is_managed ? $mc_val : '-']}</td>};
@@ -439,7 +437,7 @@ HTML
         # Expandable detail row (only for managed accounts)
         if ($is_managed) {
             my $socket = "/home/$user/.redis-managed/redis.sock";
-            my $enabled_at = $state->{$user}{enabled_at} // 'unknown';
+            my $enabled_at = html_escape($state->{$user}{enabled_at} // 'unknown');
 
             print qq{<tr id="detail-$user" class="rm-detail-row" style="display:none"><td colspan="8" class="tdshade2">};
             print qq{<div class="rm-detail-panel">};

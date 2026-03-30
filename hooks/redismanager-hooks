@@ -11,6 +11,10 @@ set -euo pipefail
 CTL="/opt/redismanager/bin/redismanager-ctl"
 STATE="/var/lib/redismanager/state.json"
 LOG="/var/log/redismanager/hooks.log"
+LOCK_FILE="/var/run/redismanager-state.lock"
+
+# Same validation regex as CLI and WHM CGI
+VALID_USER_RE='^[a-z][a-z0-9_]{0,30}$'
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] HOOK: $*" >> "$LOG"
@@ -34,8 +38,14 @@ if [[ -z "$USERNAME" ]]; then
     exit 0
 fi
 
-# Check if this user is managed by us
-if ! python3 -c "
+# Validate username format before using it in any command
+if [[ ! "$USERNAME" =~ $VALID_USER_RE ]]; then
+    log "WARNING: Invalid username format from hook: '$USERNAME'"
+    exit 0
+fi
+
+# Check if this user is managed by us (with flock for safe concurrent access)
+if ! flock -s "$LOCK_FILE" python3 -c "
 import json, sys
 with open('$STATE') as f:
     state = json.load(f)
@@ -46,8 +56,6 @@ if '$USERNAME' not in state:
     exit 0
 fi
 
-# Determine which hook called us based on the context variable
-CONTEXT="${CONTEXT:-}"
 HOOK_EVENT="${cp_hook_event:-unknown}"
 
 log "Processing hook=$HOOK_EVENT user=$USERNAME"
