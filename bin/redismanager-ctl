@@ -159,6 +159,14 @@ validate_binary() {
     fi
 }
 
+validate_memory_mb() {
+    local memory_mb="$1"
+    if [[ ! "$memory_mb" =~ ^[0-9]+$ ]] || [[ "$memory_mb" -lt 16 ]] || [[ "$memory_mb" -gt 1024 ]]; then
+        echo "ERROR: memory_mb must be between 16 and 1024" >&2
+        exit 1
+    fi
+}
+
 check_budget() {
     local requested="$1"
     local current
@@ -212,7 +220,7 @@ deploy_session_locking() {
             [[ "$f" == *.cache ]] && continue
             [[ "$(basename "$f")" == "main" ]] && continue
             local dr
-            dr=$(grep -m1 '^documentroot:' "$f" 2>/dev/null | awk '{print $2}')
+            dr=$(awk '/^documentroot:/ { print $2; exit }' "$f" 2>/dev/null)
             if [[ -n "$dr" && -d "$dr" && "$dr" != "${homedir}/public_html" ]]; then
                 docroots+=("$dr")
             fi
@@ -290,6 +298,118 @@ regenerate_config() {
     chmod 640 "$conf_file"
 }
 
+is_joomla_config() {
+    local file="$1"
+    [[ -f "$file" ]] || return 1
+    grep -q "class Config" "$file" 2>/dev/null || return 1
+    grep -q 'public \$dbtype' "$file" 2>/dev/null || return 1
+}
+
+switch_joomla_managed_redis() {
+    local file="$1" user="$2"
+    local redis_socket="/home/${user}/${USER_REDIS_DIR}/${SOCKET_NAME}"
+
+    python3 - "$file" "$redis_socket" <<'PY'
+import os
+import re
+import shutil
+import stat
+import sys
+import tempfile
+
+path = sys.argv[1]
+redis_socket = sys.argv[2]
+backup_path = path + ".redismanager.bak"
+
+with open(path, "r", encoding="utf-8") as fh:
+    original = fh.read()
+
+line_ending = "\r\n" if "\r\n" in original else "\n"
+original_stat = os.stat(path)
+
+prop_re = re.compile(r"^(\s*public\s+\$([A-Za-z0-9_]+)\s*=\s*)(['\"])(.*?)(\3\s*;\s*)$", re.MULTILINE)
+props = {m.group(2): m.group(4) for m in prop_re.finditer(original)}
+
+cache_uses_managed = props.get("cache_handler", "").lower() == "redis" and props.get("redis_server_host", "") == redis_socket
+session_uses_managed = props.get("session_handler", "").lower() == "redis" and props.get("session_redis_server_host", "") == redis_socket
+
+if not cache_uses_managed and not session_uses_managed:
+    print("unchanged")
+    sys.exit(0)
+
+updated = original
+
+def replace_prop(content, key, value):
+    pattern = re.compile(rf"^(\s*public\s+\${re.escape(key)}\s*=\s*)(['\"])(.*?)(\2\s*;\s*)$", re.MULTILINE)
+    return pattern.sub(lambda m: f"{m.group(1)}{m.group(2)}{value}{m.group(4)}", content, count=1)
+
+if cache_uses_managed:
+    updated = replace_prop(updated, "cache_handler", "file")
+
+if session_uses_managed:
+    updated = replace_prop(updated, "session_handler", "database")
+
+if updated == original:
+    print("unchanged")
+    sys.exit(0)
+
+if not os.path.exists(backup_path):
+    shutil.copy2(path, backup_path)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+        fh.write(updated.replace("\r\n", "\n").replace("\n", line_ending))
+    os.replace(tmp, path)
+    os.chmod(path, stat.S_IMODE(original_stat.st_mode))
+    try:
+        os.chown(path, original_stat.st_uid, original_stat.st_gid)
+    except PermissionError:
+        pass
+    print("updated")
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+find_and_switch_joomla_configs() {
+    local user="$1"
+    local homedir="/home/${user}"
+    local -a candidates=()
+    local -A seen=()
+
+    [[ -d "$homedir" ]] || return 0
+
+    while IFS= read -r file; do
+        [[ -n "$file" ]] || continue
+        if [[ -z "${seen[$file]+x}" ]]; then
+            candidates+=("$file")
+            seen["$file"]=1
+        fi
+    done < <(find "$homedir" \
+        \( -path "*/cache/*" -o -path "*/administrator/cache/*" -o -path "*/tmp/*" -o -path "*/logs/*" -o -path "*/.trash/*" -o -path "*/.snapshot/*" \) -prune \
+        -o -type f -name "configuration.php" -print 2>/dev/null || true)
+
+    local changed=0
+    for file in "${candidates[@]}"; do
+        is_joomla_config "$file" || continue
+        local result
+        if ! result=$(switch_joomla_managed_redis "$file" "$user"); then
+            echo "ERROR: Failed to update Joomla configuration: $file" >&2
+            exit 1
+        fi
+        if [[ "$result" == "updated" ]]; then
+            changed=$((changed + 1))
+            log "Switched Joomla Redis config to safe defaults in $file"
+        fi
+    done
+
+    if [[ $changed -gt 0 ]]; then
+        echo "Adjusted ${changed} Joomla configuration file(s) before disabling Redis."
+    fi
+}
+
 # --- Commands ---
 
 cmd_enable() {
@@ -298,6 +418,7 @@ cmd_enable() {
 
     validate_user "$user"
     validate_binary
+    validate_memory_mb "$memory_mb"
 
     # Check if already enabled
     if state_get "$user" &>/dev/null; then
@@ -353,6 +474,15 @@ cmd_enable() {
 cmd_disable() {
     local user="$1"
     validate_username_format "$user"
+
+    if ! state_get "$user" &>/dev/null; then
+        echo "ERROR: Redis not enabled for '$user'" >&2
+        exit 1
+    fi
+
+    # If Joomla still points to this managed Redis socket, switch it first to
+    # avoid leaving the site with 500s after the Redis instance disappears.
+    find_and_switch_joomla_configs "$user"
 
     # Stop and disable systemd service (don't fail if not running)
     systemctl stop "redis-managed@${user}" 2>/dev/null || true
@@ -460,6 +590,7 @@ cmd_set_memory() {
     fi
 
     validate_user "$user"
+    validate_memory_mb "$memory_mb"
 
     # Check budget (subtract current allocation, add new)
     eval "$(state_get "$user")"

@@ -28,7 +28,7 @@ Built primarily for **Joomla** sites that can't use AccelerateWP, but works for 
 
 - **Does not install its own Redis binary.** It depends on `alt-redis`, the Redis package shipped by CloudLinux as part of AccelerateWP. If `alt-redis` is not installed, RedisManager will refuse to enable instances.
 - **Does not interfere with AccelerateWP.** WordPress sites managed by AccelerateWP continue to work as before. RedisManager uses a separate directory (`~/.redis-managed/`) and AccelerateWP's monitoring daemon ignores our instances (verified by code inspection of `clwpos_monitoring`'s `_validate_redis_proc()` — it specifically checks for `.clwpos/redis.sock` in the process cmdline).
-- **Does not configure your CMS automatically.** After enabling Redis for a user, you must manually configure the CMS (Joomla, Drupal, etc.) to use the Redis socket. Instructions are shown in the WHM interface.
+- **Does not configure your CMS automatically on enable.** After enabling Redis for a user, you must manually configure the CMS (Joomla, Drupal, etc.) to use the Redis socket. Instructions are shown in the WHM interface. On disable, RedisManager now tries to switch Joomla sites using the managed socket back to `file` cache and `database` sessions first, to avoid leaving the site with 500 errors.
 - **Does not provide Redis Cluster, Sentinel, or replication.** Each instance is a standalone, single-node Redis server running in cache-only mode (no persistence).
 - **Does not manage AccelerateWP instances.** WordPress Redis managed by AccelerateWP is completely separate and should be managed through CloudLinux's own tools.
 
@@ -120,7 +120,8 @@ Go to **WHM → Plugins → Redis Manager**. From there you can:
 # Enable Redis for a user (default 64MB, 128 maxclients)
 redismanager-ctl enable <username> [memory_mb]
 
-# Disable Redis (stops instance, removes data, cleans .user.ini)
+# Disable Redis (first switches Joomla off the managed Redis socket when detected,
+# then stops the instance, removes data, and cleans .user.ini)
 redismanager-ctl disable <username>
 
 # Check status
@@ -202,6 +203,15 @@ redis.session.lock_wait_time = 10000
 **Why `.user.ini`?** On cPanel with PHP-FPM or LSAPI, `.user.ini` is the standard, non-destructive way to override PHP settings per directory without touching global `php.ini` or cPanel-managed vhost configs. PHP re-reads it every `user_ini.cache_ttl` seconds (default 300). The file uses marker comments (`>>> RedisManager` / `<<< RedisManager`) so we can cleanly add and remove our block without affecting other settings in the same file.
 
 **Cleanup:** When Redis is disabled for a user, only the RedisManager block is removed from `.user.ini`. If the file had other settings, they're preserved. If it becomes empty, the file is deleted.
+
+### Automatic Joomla fallback on disable
+
+Before a managed Redis instance is disabled, RedisManager scans the user's home for Joomla `configuration.php` files. If a config is actively using the managed socket (`/home/<user>/.redis-managed/redis.sock`), it switches:
+
+- `cache_handler` from `redis` to `file`
+- `session_handler` from `redis` to `database`
+
+The original file is preserved as `configuration.php.redismanager.bak`. Only Joomla configs pointing at the managed Redis socket are changed; unrelated Redis setups are left alone.
 
 **New domains:** If you add a new addon domain or subdomain after enabling Redis, the `.user.ini` won't be deployed to the new document root automatically. Run `redismanager-ctl disable <user>` followed by `redismanager-ctl enable <user>` to redeploy.
 

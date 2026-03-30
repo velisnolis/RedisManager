@@ -41,10 +41,14 @@ with open('$STATE_DIR/state.json') as f:
 for user in state:
     print(user)
 " 2>/dev/null | while read -r user; do
-        echo "  Stopping redis-managed@${user}..."
-        systemctl stop "redis-managed@${user}" 2>/dev/null || true
-        systemctl disable "redis-managed@${user}" 2>/dev/null || true
-        rm -rf "/home/${user}/.redis-managed" 2>/dev/null || true
+        echo "  Disabling Redis for ${user}..."
+        if [[ -x "$INSTALL_DIR/bin/redismanager-ctl" ]]; then
+            "$INSTALL_DIR/bin/redismanager-ctl" disable "$user" 2>/dev/null || true
+        else
+            systemctl stop "redis-managed@${user}" 2>/dev/null || true
+            systemctl disable "redis-managed@${user}" 2>/dev/null || true
+            rm -rf "/home/${user}/.redis-managed" 2>/dev/null || true
+        fi
     done
 fi
 
