@@ -113,6 +113,7 @@ Go to **WHM → Plugins → Redis Manager**. From there you can:
 - **Set memory / maxclients** per account
 - **Restart**, **Flush**, or **Disable** an instance
 - **Edit global configuration** (default memory, default maxclients, total budget) — saved to `/opt/redismanager/etc/redismanager.conf`
+- **Select the Redis / Valkey server binary** from detected binaries and apply it without reinstalling the plugin
 
 ### WHM registration notes
 
@@ -245,6 +246,17 @@ Any application that supports Redis via Unix sockets can use the managed instanc
 - **Port:** not applicable (socket connection)
 - **Password:** none
 - **Databases:** 0 and 1 available (2 databases configured by default)
+
+### Changing the Redis / Valkey binary
+
+The global configuration panel can detect supported server binaries (for example CloudLinux Redis and Valkey installs), save the selected path as `REDIS_BINARY`, regenerate `redis-managed@.service`, reload systemd, and restart managed instances.
+
+From the CLI, the same flow is available with:
+
+```bash
+redismanager-ctl list-binaries
+redismanager-ctl apply-binary /path/to/redis-server-or-valkey-server
+```
 
 ## Architecture
 

@@ -49,13 +49,14 @@ my @accounts  = get_cpanel_accounts();
 my %state     = get_state();
 my %info      = get_info();
 my %conf      = get_conf();
+my @binaries  = get_binary_candidates();
 
 # --- WHM header ---
 print "Content-Type: text/html\r\n\r\n";
 Whostmgr::HTMLInterface::defheader("Redis Manager v${VERSION}", '/addon_plugins/redismanager-icon.svg', '/cgi/addon_redismanager.cgi');
 
 # --- Page content ---
-print_page(\@accounts, \%state, \%info, \%conf, $message, $msg_type);
+print_page(\@accounts, \%state, \%info, \%conf, \@binaries, $message, $msg_type);
 
 # --- WHM footer ---
 Whostmgr::HTMLInterface::sendfooter();
@@ -121,11 +122,13 @@ sub handle_action {
 
 sub save_global_config {
     my ($cgi_obj) = @_;
+    my %existing_conf = get_conf();
 
     # Read params from the SAME CGI instance (POST body is already consumed)
     my $new_mem = $cgi_obj->param('cfg_default_memory')     // '';
     my $new_mc  = $cgi_obj->param('cfg_default_maxclients')  // '';
     my $new_bud = $cgi_obj->param('cfg_total_budget')        // '';
+    my $new_bin = $cgi_obj->param('cfg_redis_binary')        // '';
 
     # Validate
     if ($new_mem && !($new_mem =~ /^\d+$/ && $new_mem >= 16 && $new_mem <= 1024)) {
@@ -136,6 +139,9 @@ sub save_global_config {
     }
     if ($new_bud && !($new_bud =~ /^\d+$/ && $new_bud >= 64 && $new_bud <= 65536)) {
         return ('Invalid total budget (64-65536)', 'error');
+    }
+    if ($new_bin && !($new_bin =~ m{^/[A-Za-z0-9_./+-]+$})) {
+        return ('Invalid Redis binary path', 'error');
     }
 
     # Read current config
@@ -159,6 +165,15 @@ sub save_global_config {
     open my $wfh, '>', $CONF_FILE or return ("Cannot write config: $!", 'error');
     print $wfh @lines;
     close $wfh;
+
+    if ($new_bin && ($existing_conf{REDIS_BINARY} // '') ne $new_bin) {
+        my $output = `$CTL apply-binary '$new_bin' 2>&1`;
+        my $rc = $? >> 8;
+        if ($rc != 0) {
+            chomp $output;
+            return ("Config saved, but failed to apply binary: " . html_escape($output), 'error');
+        }
+    }
 
     return ('Global configuration saved', 'success');
 }
@@ -230,6 +245,22 @@ sub get_conf {
     return %conf;
 }
 
+sub get_binary_candidates {
+    my @binaries;
+    my $output = `$CTL list-binaries 2>/dev/null`;
+    for my $line (split /\n/, $output // '') {
+        next unless $line;
+        my ($path, $version, $cli) = split /\t/, $line, 3;
+        next unless $path;
+        push @binaries, {
+            path    => $path,
+            version => ($version // ''),
+            cli     => ($cli // ''),
+        };
+    }
+    return @binaries;
+}
+
 sub is_service_active {
     my ($user) = @_;
     system("systemctl is-active --quiet 'redis-managed\@${user}' 2>/dev/null");
@@ -237,7 +268,7 @@ sub is_service_active {
 }
 
 sub print_page {
-    my ($accounts, $state, $info, $conf, $msg, $msg_type) = @_;
+    my ($accounts, $state, $info, $conf, $binaries, $msg, $msg_type) = @_;
 
     my $total_mem  = 0;
     my $total_inst = 0;
@@ -256,6 +287,7 @@ sub print_page {
 
     my $default_mem = $conf->{DEFAULT_MEMORY_MB} // 64;
     my $default_mc  = $conf->{DEFAULT_MAXCLIENTS} // 128;
+    my $current_binary = $conf->{REDIS_BINARY} // '/opt/alt/redis/bin/redis-server';
 
     # CSS
     print <<HTML;
@@ -290,6 +322,7 @@ sub print_page {
     .rm-config-field { display: flex; flex-direction: column; gap: 3px; }
     .rm-config-field label { font-size: 12px; color: #666; }
     .rm-config-field input { width: 80px; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; text-align: center; }
+    .rm-config-field select { min-width: 460px; max-width: 100%; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; }
 </style>
 <script>
 function rmToggle(user) {
@@ -334,6 +367,29 @@ HTML
 HTML
 
     # Global config panel
+    my %seen_binary = map { $_->{path} => 1 } @$binaries;
+    my @binary_options = @$binaries;
+    if (!$seen_binary{$current_binary}) {
+        unshift @binary_options, {
+            path    => $current_binary,
+            version => 'current (not auto-detected)',
+            cli     => '',
+        };
+    }
+
+    my $binary_select = qq{<select name="cfg_redis_binary">};
+    for my $bin (@binary_options) {
+        my $path = html_escape($bin->{path});
+        my $version = html_escape($bin->{version} // '');
+        my $cli = html_escape($bin->{cli} // '');
+        my $selected = ($bin->{path} // '') eq $current_binary ? ' selected' : '';
+        my $label = $path;
+        $label .= " — $version" if $version ne '';
+        $label .= " (cli: $cli)" if $cli ne '';
+        $binary_select .= qq{<option value="$path"$selected>$label</option>};
+    }
+    $binary_select .= qq{</select>};
+
     print <<HTML;
 <div class="rm-config-panel">
     <h3>Global Configuration</h3>
@@ -351,6 +407,10 @@ HTML
             <div class="rm-config-field">
                 <label>Total budget (MB)</label>
                 <input type="number" name="cfg_total_budget" value="$budget_mb" min="64" max="65536">
+            </div>
+            <div class="rm-config-field">
+                <label>Redis / Valkey binary</label>
+                $binary_select
             </div>
             <div class="rm-config-field">
                 <label>&nbsp;</label>

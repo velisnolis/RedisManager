@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 CONF_FILE="${SCRIPT_DIR}/etc/redismanager.conf"
 TEMPLATE_FILE="${SCRIPT_DIR}/templates/redis-user.conf.tmpl"
+SYSTEMD_TEMPLATE="${SCRIPT_DIR}/templates/redis-managed.service"
+SYSTEMD_UNIT="/etc/systemd/system/redis-managed@.service"
 LOCK_FILE="/var/run/redismanager-state.lock"
 
 # Load configuration
@@ -56,6 +58,9 @@ Commands:
   info                            Show global resource usage
   set-memory <username> <mb>      Change memory limit for a user
   set-maxclients <username> <n>   Change max connections for a user
+  list-binaries                   List detected Redis/Valkey server binaries
+  apply-binary <path>             Switch binary, rewrite systemd unit, restart managed instances
+  render-unit                     Render redis-managed@.service from current config
 
 EOF
     exit 1
@@ -157,6 +162,62 @@ validate_binary() {
         echo "       Install alt-redis or update REDIS_BINARY in $CONF_FILE" >&2
         exit 1
     fi
+}
+
+guess_cli_for_binary() {
+    local binary_path="$1"
+    local bin_dir
+    bin_dir="$(dirname "$binary_path")"
+    local cli_candidates=()
+
+    case "$(basename "$binary_path")" in
+        valkey-server)
+            cli_candidates+=("${bin_dir}/valkey-cli" "${bin_dir}/redis-cli")
+            ;;
+        redis-server)
+            cli_candidates+=("${bin_dir}/redis-cli" "${bin_dir}/valkey-cli")
+            ;;
+        *)
+            cli_candidates+=("${bin_dir}/redis-cli" "${bin_dir}/valkey-cli")
+            ;;
+    esac
+
+    local candidate
+    for candidate in "${cli_candidates[@]}"; do
+        if [[ -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+list_available_binaries() {
+    local -a candidates=(
+        /opt/alt/redis/bin/redis-server
+        /opt/alt/valkey/bin/valkey-server
+        /usr/bin/redis-server
+        /usr/bin/valkey-server
+        /usr/local/bin/redis-server
+        /usr/local/bin/valkey-server
+    )
+    local detected
+    detected=$(command -v redis-server 2>/dev/null || true)
+    [[ -n "$detected" ]] && candidates+=("$detected")
+    detected=$(command -v valkey-server 2>/dev/null || true)
+    [[ -n "$detected" ]] && candidates+=("$detected")
+
+    local -A seen=()
+    local candidate version cli
+    for candidate in "${candidates[@]}"; do
+        [[ -x "$candidate" ]] || continue
+        [[ -z "${seen[$candidate]+x}" ]] || continue
+        seen["$candidate"]=1
+        version=$("$candidate" --version 2>/dev/null | head -n1 | tr '\n' ' ' | sed 's/[[:space:]]\+$//')
+        cli=$(guess_cli_for_binary "$candidate" || true)
+        printf '%s\t%s\t%s\n' "$candidate" "${version:-unknown}" "${cli:-}"
+    done
 }
 
 validate_memory_mb() {
@@ -296,6 +357,99 @@ regenerate_config() {
 
     chown "${user}:${user}" "$conf_file"
     chmod 640 "$conf_file"
+}
+
+render_systemd_unit() {
+    [[ -f "$SYSTEMD_TEMPLATE" ]] || {
+        echo "ERROR: Systemd template not found: $SYSTEMD_TEMPLATE" >&2
+        exit 1
+    }
+
+    local exec_start
+    if [[ "$USE_CAGEFS" == "true" ]]; then
+        exec_start="${CAGEFS_ENTER} ${REDIS_BINARY} /home/%i/${USER_REDIS_DIR}/redis.conf"
+    else
+        exec_start="${REDIS_BINARY} /home/%i/${USER_REDIS_DIR}/redis.conf"
+    fi
+
+    python3 - "$SYSTEMD_TEMPLATE" "$SYSTEMD_UNIT" "$exec_start" "$USER_REDIS_DIR" <<'PY'
+import os
+import sys
+import tempfile
+
+template_path, output_path, exec_start, user_redis_dir = sys.argv[1:5]
+
+with open(template_path, "r", encoding="utf-8") as fh:
+    content = fh.read()
+
+content = content.replace("{{EXEC_START}}", exec_start)
+content = content.replace("{{USER_REDIS_DIR}}", user_redis_dir)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(output_path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(content)
+    os.replace(tmp, output_path)
+    os.chmod(output_path, 0o644)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+update_global_binary_config() {
+    local new_binary="$1"
+    local new_cli="$2"
+
+    python3 - "$CONF_FILE" "$new_binary" "$new_cli" <<'PY'
+import os
+import sys
+import tempfile
+
+conf_path, new_binary, new_cli = sys.argv[1:4]
+with open(conf_path, "r", encoding="utf-8") as fh:
+    lines = fh.readlines()
+
+found_binary = False
+found_cli = False
+for idx, line in enumerate(lines):
+    if line.startswith("REDIS_BINARY="):
+        lines[idx] = f'REDIS_BINARY="{new_binary}"\n'
+        found_binary = True
+    elif line.startswith("REDIS_CLI="):
+        lines[idx] = f'REDIS_CLI="{new_cli}"\n'
+        found_cli = True
+
+if not found_binary:
+    lines.append(f'REDIS_BINARY="{new_binary}"\n')
+if not found_cli:
+    lines.append(f'REDIS_CLI="{new_cli}"\n')
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(conf_path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.writelines(lines)
+    os.replace(tmp, conf_path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+restart_managed_instances() {
+    local restarted=0 failed=0
+    local user
+    while IFS=' ' read -r user _; do
+        [[ -n "$user" ]] || continue
+        if systemctl restart "redis-managed@${user}" 2>/dev/null; then
+            restarted=$((restarted + 1))
+        else
+            failed=$((failed + 1))
+            echo "WARN: Failed to restart redis-managed@${user}" >&2
+        fi
+    done < <(state_list_users)
+
+    printf '%s %s\n' "$restarted" "$failed"
 }
 
 is_joomla_config() {
@@ -692,9 +846,65 @@ cmd_info() {
     echo "CageFS:       $USE_CAGEFS"
     echo ""
 
+    echo "=== Detected Binaries ==="
+    if ! list_available_binaries; then
+        echo "No Redis/Valkey server binaries detected"
+    fi
+    echo ""
+
     # Show system memory
     echo "=== System Memory ==="
     free -m | head -2
+}
+
+cmd_list_binaries() {
+    list_available_binaries
+}
+
+cmd_render_unit() {
+    validate_binary
+    render_systemd_unit
+    systemctl daemon-reload
+    echo "Rendered ${SYSTEMD_UNIT} using ${REDIS_BINARY}"
+}
+
+cmd_apply_binary() {
+    local new_binary="$1"
+    local new_cli
+
+    if [[ ! "$new_binary" =~ ^/[A-Za-z0-9._/+-]+$ ]]; then
+        echo "ERROR: Invalid binary path: $new_binary" >&2
+        exit 1
+    fi
+    if [[ ! -x "$new_binary" ]]; then
+        echo "ERROR: Binary not found or not executable: $new_binary" >&2
+        exit 1
+    fi
+
+    new_cli=$(guess_cli_for_binary "$new_binary" || true)
+    if [[ -z "$new_cli" ]]; then
+        echo "ERROR: Could not find a matching CLI binary for: $new_binary" >&2
+        exit 1
+    fi
+
+    update_global_binary_config "$new_binary" "$new_cli"
+
+    # Reload config for the current process before rendering/restarting.
+    # shellcheck source=/dev/null
+    source "$CONF_FILE"
+
+    render_systemd_unit
+    systemctl daemon-reload
+
+    local restarted failed
+    read -r restarted failed < <(restart_managed_instances)
+
+    log "APPLIED binary change REDIS_BINARY=${new_binary} REDIS_CLI=${new_cli} restarted=${restarted} failed=${failed}"
+    echo "Applied binary: ${new_binary}"
+    echo "CLI binary:     ${new_cli}"
+    echo "Restarted:      ${restarted}"
+    echo "Failed:         ${failed}"
+    [[ "$failed" -eq 0 ]]
 }
 
 # --- Main ---
@@ -740,6 +950,16 @@ case "$CMD" in
     set-maxclients)
         [[ $# -lt 2 ]] && { echo "Usage: $(basename "$0") set-maxclients <username> <n>"; exit 1; }
         cmd_set_maxclients "$@"
+        ;;
+    list-binaries)
+        cmd_list_binaries
+        ;;
+    apply-binary)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") apply-binary <path>"; exit 1; }
+        cmd_apply_binary "$@"
+        ;;
+    render-unit)
+        cmd_render_unit
         ;;
     *)
         echo "Unknown command: $CMD" >&2

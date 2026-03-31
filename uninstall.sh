@@ -27,7 +27,7 @@ echo "  - Remove all plugin files"
 echo ""
 echo "User data in ~/.redis-managed/ will also be removed."
 echo ""
-read -p "Continue? (yes/no): " CONFIRM
+read -r -p "Continue? (yes/no): " CONFIRM
 if [[ "$CONFIRM" != "yes" ]]; then
     echo "Aborted."
     exit 0

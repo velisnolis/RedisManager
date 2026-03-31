@@ -6,7 +6,6 @@ set -euo pipefail
 INSTALL_DIR="/opt/redismanager"
 STATE_DIR="/var/lib/redismanager"
 LOG_DIR="/var/log/redismanager"
-SYSTEMD_UNIT="/etc/systemd/system/redis-managed@.service"
 WHM_CGI="/usr/local/cpanel/whostmgr/docroot/cgi/addon_redismanager.cgi"
 APPCONFIG="/var/cpanel/apps/addon_redismanager.conf"
 LEGACY_APPCONFIG="/var/cpanel/apps/redismanager.conf"
@@ -54,8 +53,8 @@ if [[ ! -f "$STATE_DIR/state.json" ]]; then
 fi
 
 echo "[2/7] Installing systemd template unit..."
-cp "$SCRIPT_DIR/templates/redis-managed.service" "$SYSTEMD_UNIT"
-systemctl daemon-reload
+cp "$SCRIPT_DIR/templates/redis-managed.service" "$INSTALL_DIR/templates/"
+"$INSTALL_DIR/bin/redismanager-ctl" render-unit
 
 echo "[3/7] Installing WHM plugin..."
 cp "$SCRIPT_DIR/whm/addon_redismanager.cgi" "$WHM_CGI"
