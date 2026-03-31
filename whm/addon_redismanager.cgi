@@ -261,6 +261,27 @@ sub get_binary_candidates {
     return @binaries;
 }
 
+sub binary_friendly_name {
+    my ($path, $version) = @_;
+    my $name = 'Custom binary';
+
+    if (($path // '') =~ m{/opt/alt/valkey/bin/valkey-server$}) {
+        $name = 'CloudLinux Valkey';
+    } elsif (($path // '') =~ m{/opt/alt/redis/bin/redis-server$}) {
+        $name = 'CloudLinux Redis';
+    } elsif (($path // '') =~ m{/valkey-server$}) {
+        $name = 'Valkey';
+    } elsif (($path // '') =~ m{/redis-server$}) {
+        $name = 'Redis';
+    }
+
+    if (($version // '') =~ /v=([0-9][^ ]*)/) {
+        $name .= " $1";
+    }
+
+    return $name;
+}
+
 sub is_service_active {
     my ($user) = @_;
     system("systemctl is-active --quiet 'redis-managed\@${user}' 2>/dev/null");
@@ -318,11 +339,18 @@ sub print_page {
     /* Global config panel */
     .rm-config-panel { background: #f5f7fa; border: 1px solid #d9dee4; border-radius: 4px; padding: 15px 20px; margin-bottom: 20px; }
     .rm-config-panel h3 { margin: 0 0 12px; font-size: 14px; }
-    .rm-config-grid { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
-    .rm-config-field { display: flex; flex-direction: column; gap: 3px; }
+    .rm-config-grid { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-start; }
+    .rm-config-field { display: flex; flex-direction: column; gap: 3px; justify-content: flex-start; }
+    .rm-config-field-small { min-width: 120px; }
+    .rm-config-field-binary { flex: 0 1 420px; min-width: 220px; }
+    .rm-config-field-details { flex: 0 1 auto; min-width: 280px; max-width: 100%; }
+    .rm-config-field-action { margin-left: auto; justify-content: flex-start; }
     .rm-config-field label { font-size: 12px; color: #666; }
     .rm-config-field input { width: 80px; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; text-align: center; }
-    .rm-config-field select { min-width: 460px; max-width: 100%; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; }
+    .rm-config-field select { width: 100%; min-width: 220px; max-width: 100%; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; }
+    .rm-config-help { min-height: 64px; padding: 8px 10px; border: 1px solid #d9dee4; border-radius: 4px; background: #fff; font-size: 12px; line-height: 1.45; color: #555; }
+    .rm-config-help code { font-size: 11px; background: #eef3f8; padding: 1px 4px; border-radius: 3px; }
+    .rm-config-help .rm-help-title { display: block; font-weight: 600; color: #333; margin-bottom: 3px; }
 </style>
 <script>
 function rmToggle(user) {
@@ -340,6 +368,22 @@ function rmConfirm(action, user) {
     if (action === 'disable') return confirm('Disable Redis for ' + user + '? This will delete all cached data.');
     if (action === 'flush') return confirm('Flush all Redis data for ' + user + '?');
     return true;
+}
+function rmUpdateBinaryDetails() {
+    var select = document.getElementById('cfg_redis_binary');
+    var panel = document.getElementById('rm-binary-details');
+    if (!select || !panel) return;
+    var option = select.options[select.selectedIndex];
+    if (!option) return;
+    var title = option.getAttribute('data-friendly') || option.textContent;
+    var version = option.getAttribute('data-version') || 'Unknown version';
+    var path = option.value || '';
+    var cli = option.getAttribute('data-cli') || 'Not detected';
+    panel.innerHTML =
+        '<span class="rm-help-title">' + title + '</span>' +
+        'Version: <code>' + version + '</code><br>' +
+        'Server path: <code>' + path + '</code><br>' +
+        'CLI path: <code>' + cli + '</code>';
 }
 </script>
 
@@ -377,16 +421,14 @@ HTML
         };
     }
 
-    my $binary_select = qq{<select name="cfg_redis_binary">};
+    my $binary_select = qq{<select name="cfg_redis_binary" id="cfg_redis_binary" onchange="rmUpdateBinaryDetails()">};
     for my $bin (@binary_options) {
         my $path = html_escape($bin->{path});
         my $version = html_escape($bin->{version} // '');
         my $cli = html_escape($bin->{cli} // '');
+        my $friendly = html_escape(binary_friendly_name($bin->{path}, $bin->{version}));
         my $selected = ($bin->{path} // '') eq $current_binary ? ' selected' : '';
-        my $label = $path;
-        $label .= " — $version" if $version ne '';
-        $label .= " (cli: $cli)" if $cli ne '';
-        $binary_select .= qq{<option value="$path"$selected>$label</option>};
+        $binary_select .= qq{<option value="$path" data-friendly="$friendly" data-version="$version" data-cli="$cli"$selected>$friendly</option>};
     }
     $binary_select .= qq{</select>};
 
@@ -396,23 +438,27 @@ HTML
     <form method="post" action="$form_action">
         <input type="hidden" name="action" value="save-config">
         <div class="rm-config-grid">
-            <div class="rm-config-field">
+            <div class="rm-config-field rm-config-field-small">
                 <label>Default memory (MB)</label>
                 <input type="number" name="cfg_default_memory" value="$default_mem" min="16" max="1024">
             </div>
-            <div class="rm-config-field">
+            <div class="rm-config-field rm-config-field-small">
                 <label>Default maxclients</label>
                 <input type="number" name="cfg_default_maxclients" value="$default_mc" min="8" max="4096">
             </div>
-            <div class="rm-config-field">
+            <div class="rm-config-field rm-config-field-small">
                 <label>Total budget (MB)</label>
                 <input type="number" name="cfg_total_budget" value="$budget_mb" min="64" max="65536">
             </div>
-            <div class="rm-config-field">
+            <div class="rm-config-field rm-config-field-binary">
                 <label>Redis / Valkey binary</label>
                 $binary_select
             </div>
-            <div class="rm-config-field">
+            <div class="rm-config-field rm-config-field-details">
+                <label>Selected binary</label>
+                <div id="rm-binary-details" class="rm-config-help"></div>
+            </div>
+            <div class="rm-config-field rm-config-field-action">
                 <label>&nbsp;</label>
                 <button type="submit" class="btn btn-primary btn-sm">Save</button>
             </div>
@@ -571,4 +617,6 @@ HTML
 
 </div>
 HTML
+
+    print qq{<script>rmUpdateBinaryDetails();</script>\n};
 }

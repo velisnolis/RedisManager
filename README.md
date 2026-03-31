@@ -17,8 +17,9 @@ Built primarily for **Joomla** sites that can't use AccelerateWP, but works for 
 - Creates **isolated Redis instances per cPanel user**, each running under the user's UID inside CageFS
 - Uses **Unix sockets** (no TCP ports exposed) with `600` permissions — users can only access their own Redis
 - Integrates with **CloudLinux LVE limits** — Redis memory and CPU count towards the user's resource allocation
-- Provides a **WHM admin interface** (Plugins → Redis Manager) to enable/disable Redis per account, adjust memory and maxclients, and edit global settings
+- Provides a **WHM admin interface** (Plugins → Redis Manager) to enable/disable Redis per account, adjust memory and maxclients, edit global settings, and inspect active Joomla wiring
 - Automatically deploys **PHP session locking** (`.user.ini`) to prevent race conditions in Joomla admin
+- Can **detect available Redis / Valkey binaries**, switch the selected server binary, regenerate the systemd template, and restart managed instances from WHM
 - Includes **cPanel hooks** for automatic cleanup on account deletion/suspension
 - Runs a **health check cron** every 5 minutes to restart failed instances
 - Enforces a **global memory budget** (default: 2 GB) to prevent overcommitting server RAM
@@ -26,7 +27,7 @@ Built primarily for **Joomla** sites that can't use AccelerateWP, but works for 
 
 ## What it does NOT do
 
-- **Does not install its own Redis binary.** It depends on `alt-redis`, the Redis package shipped by CloudLinux as part of AccelerateWP. If `alt-redis` is not installed, RedisManager will refuse to enable instances.
+- **Does not install its own Redis binary.** It expects an existing Redis or Valkey server binary on the host. By default this is usually CloudLinux `alt-redis`, but the binary is selectable from the global configuration panel.
 - **Does not interfere with AccelerateWP.** WordPress sites managed by AccelerateWP continue to work as before. RedisManager uses a separate directory (`~/.redis-managed/`) and AccelerateWP's monitoring daemon ignores our instances (verified by code inspection of `clwpos_monitoring`'s `_validate_redis_proc()` — it specifically checks for `.clwpos/redis.sock` in the process cmdline).
 - **Does not configure your CMS automatically on enable.** After enabling Redis for a user, you must manually configure the CMS (Joomla, Drupal, etc.) to use the Redis socket. Instructions are shown in the WHM interface. On disable, RedisManager now tries to switch Joomla sites using the managed socket back to `file` cache and `database` sessions first, to avoid leaving the site with 500 errors.
 - **Does not provide Redis Cluster, Sentinel, or replication.** Each instance is a standalone, single-node Redis server running in cache-only mode (no persistence).
@@ -41,7 +42,7 @@ Built primarily for **Joomla** sites that can't use AccelerateWP, but works for 
 
 ## Compatibility
 
-- **Redis → Valkey migration:** CloudLinux may migrate from Redis to Valkey (the open-source Redis fork). This is fully compatible — same protocol, same config format. Update `REDIS_BINARY` in the global configuration and reinstall the systemd template unit (re-run `install.sh`). See [Known limitation: REDIS_BINARY vs systemd](#known-limitation-redis_binary-vs-systemd).
+- **Redis → Valkey migration:** CloudLinux may migrate from Redis to Valkey (the open-source Redis fork). RedisManager supports this by detecting compatible binaries, letting you select one from WHM, and applying the change without reinstalling the plugin.
 
 ## Installation
 
@@ -114,6 +115,7 @@ Go to **WHM → Plugins → Redis Manager**. From there you can:
 - **Restart**, **Flush**, or **Disable** an instance
 - **Edit global configuration** (default memory, default maxclients, total budget) — saved to `/opt/redismanager/etc/redismanager.conf`
 - **Select the Redis / Valkey server binary** from detected binaries and apply it without reinstalling the plugin
+- **Review the selected binary details** (friendly name, version, server path, CLI path) directly in the global configuration panel
 
 ### WHM registration notes
 
@@ -251,6 +253,8 @@ Any application that supports Redis via Unix sockets can use the managed instanc
 
 The global configuration panel can detect supported server binaries (for example CloudLinux Redis and Valkey installs), save the selected path as `REDIS_BINARY`, regenerate `redis-managed@.service`, reload systemd, and restart managed instances.
 
+The WHM dropdown shows a short friendly label, while the adjacent info panel shows the active binary's version plus the server and CLI paths. This keeps the selector readable without hiding operational detail.
+
 From the CLI, the same flow is available with:
 
 ```bash
@@ -331,20 +335,6 @@ Global settings are in `/opt/redismanager/etc/redismanager.conf` (also editable 
 | `DEFAULT_MAXCLIENTS` | `128` | Default max connections per instance |
 | `TOTAL_BUDGET_MB` | `2048` | Total memory budget across all instances |
 | `USE_CAGEFS` | `true` | Launch Redis inside CageFS |
-
-### Known limitation: REDIS_BINARY vs systemd
-
-The `REDIS_BINARY` setting in `redismanager.conf` controls which binary the CLI validates and displays, but the **systemd template unit** (`redis-managed@.service`) has the binary path hardcoded in its `ExecStart` directive. If you change `REDIS_BINARY` (e.g., for a Redis → Valkey migration), you must also re-run `install.sh` to update the systemd unit, then restart affected instances:
-
-```bash
-cd /path/to/RedisManager
-bash install.sh
-systemctl daemon-reload
-# Restart all managed instances
-for user in $(redismanager-ctl list | awk 'NR>2 && $1!="Total:" && $1!="----" {print $1}'); do
-    redismanager-ctl restart "$user"
-done
-```
 
 ## Security notes
 
