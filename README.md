@@ -114,6 +114,19 @@ Go to **WHM → Plugins → Redis Manager**. From there you can:
 - **Restart**, **Flush**, or **Disable** an instance
 - **Edit global configuration** (default memory, default maxclients, total budget) — saved to `/opt/redismanager/etc/redismanager.conf`
 
+### WHM registration notes
+
+RedisManager uses WHM AppConfig registration at `/var/cpanel/apps/addon_redismanager.conf` and installs its CGI at `/usr/local/cpanel/whostmgr/docroot/cgi/addon_redismanager.cgi`.
+
+The plugin metadata includes:
+
+- `entryurl=addon_redismanager.cgi`
+- `icon=redismanager-icon.png`
+- `target=_self`
+- `#WHMADDON` / `#ACLS` headers in the CGI
+
+These are required so WHM indexes the plugin correctly and shows it under **Plugins**. If the plugin file exists on disk but does not appear in WHM, re-run `install.sh` to re-register AppConfig cleanly.
+
 ### Command Line
 
 ```bash

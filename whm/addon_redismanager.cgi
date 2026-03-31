@@ -1,4 +1,6 @@
 #!/usr/local/cpanel/3rdparty/bin/perl
+#WHMADDON:addon_redismanager:Redis Manager:redismanager-icon.png
+#ACLS:all
 # RedisManager WHM Plugin — Admin Interface
 # Installs to: /usr/local/cpanel/whostmgr/docroot/cgi/addon_redismanager.cgi
 
