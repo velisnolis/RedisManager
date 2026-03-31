@@ -7,7 +7,8 @@ INSTALL_DIR="/opt/redismanager"
 STATE_DIR="/var/lib/redismanager"
 SYSTEMD_UNIT="/etc/systemd/system/redis-managed@.service"
 WHM_CGI="/usr/local/cpanel/whostmgr/docroot/cgi/addon_redismanager.cgi"
-APPCONFIG="/var/cpanel/apps/redismanager.conf"
+APPCONFIG="/var/cpanel/apps/addon_redismanager.conf"
+LEGACY_APPCONFIG="/var/cpanel/apps/redismanager.conf"
 CRON_FILE="/etc/cron.d/redismanager"
 
 echo "=== RedisManager Uninstaller ==="
@@ -61,6 +62,10 @@ rm -f "$WHM_CGI"
 if [[ -f "$APPCONFIG" ]]; then
     /usr/local/cpanel/bin/unregister_appconfig "$APPCONFIG" 2>/dev/null || true
     rm -f "$APPCONFIG"
+fi
+if [[ -f "$LEGACY_APPCONFIG" ]]; then
+    /usr/local/cpanel/bin/unregister_appconfig "$LEGACY_APPCONFIG" 2>/dev/null || true
+    rm -f "$LEGACY_APPCONFIG"
 fi
 
 echo "[4/6] Removing cPanel hooks..."
