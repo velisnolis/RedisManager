@@ -46,11 +46,13 @@ cp "$SCRIPT_DIR/cron/redismanager-healthcheck"    "$INSTALL_DIR/cron/"
 chmod +x "$INSTALL_DIR/bin/redismanager-ctl"
 chmod +x "$INSTALL_DIR/hooks/redismanager-hooks"
 chmod +x "$INSTALL_DIR/cron/redismanager-healthcheck"
+chmod 644 "$INSTALL_DIR/etc/redismanager.conf"
 
 # Initialize state file if not present
 if [[ ! -f "$STATE_DIR/state.json" ]]; then
     echo '{}' > "$STATE_DIR/state.json"
 fi
+chmod 644 "$STATE_DIR/state.json"
 
 echo "[2/7] Installing systemd template unit..."
 cp "$SCRIPT_DIR/templates/redis-managed.service" "$INSTALL_DIR/templates/"

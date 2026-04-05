@@ -25,7 +25,7 @@ echo "  - Remove the WHM plugin"
 echo "  - Remove cPanel hooks"
 echo "  - Remove all plugin files"
 echo ""
-echo "User data in ~/.redis-managed/ will also be removed."
+echo "User data in ~/.redis-managed/ and ~/.clwpos/redismanager/ will also be removed."
 echo ""
 read -r -p "Continue? (yes/no): " CONFIRM
 if [[ "$CONFIRM" != "yes" ]]; then
@@ -48,7 +48,7 @@ for user in state:
         else
             systemctl stop "redis-managed@${user}" 2>/dev/null || true
             systemctl disable "redis-managed@${user}" 2>/dev/null || true
-            rm -rf "/home/${user}/.redis-managed" 2>/dev/null || true
+            rm -rf "/home/${user}/.redis-managed" "/home/${user}/.clwpos/redismanager" 2>/dev/null || true
         fi
     done
 fi

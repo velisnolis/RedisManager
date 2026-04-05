@@ -9,6 +9,8 @@ TEMPLATE_FILE="${SCRIPT_DIR}/templates/redis-user.conf.tmpl"
 SYSTEMD_TEMPLATE="${SCRIPT_DIR}/templates/redis-managed.service"
 SYSTEMD_UNIT="/etc/systemd/system/redis-managed@.service"
 LOCK_FILE="/var/run/redismanager-state.lock"
+LEGACY_REDIS_DIR=".redis-managed"
+ISOLATED_REDIS_DIR=".clwpos/redismanager"
 
 # Load configuration
 if [[ ! -f "$CONF_FILE" ]]; then
@@ -61,6 +63,7 @@ Commands:
   list-binaries                   List detected Redis/Valkey server binaries
   apply-binary <path>             Switch binary, rewrite systemd unit, restart managed instances
   render-unit                     Render redis-managed@.service from current config
+  launch  <username>              Internal: start a user's Redis instance
 
 EOF
     exit 1
@@ -81,30 +84,40 @@ if u:
     print(f\"memory={u.get('memory_mb', $DEFAULT_MEMORY_MB)}\")
     print(f\"maxclients={u.get('maxclients', $DEFAULT_MAXCLIENTS)}\")
     print(f\"enabled_at={u.get('enabled_at', 'unknown')}\")
+    if u.get('redis_dir'):
+        print(f\"redis_dir={u.get('redis_dir')}\")
 else:
     sys.exit(1)
 " 2>/dev/null
 }
 
 state_set() {
-    local user="$1" memory_mb="$2" maxclients="${3:-$DEFAULT_MAXCLIENTS}"
-    flock "$LOCK_FILE" python3 -c "
+    local user="$1" memory_mb="$2" maxclients="${3:-$DEFAULT_MAXCLIENTS}" redis_dir="${4:-}"
+    flock "$LOCK_FILE" python3 - "$STATE_FILE" "$user" "$memory_mb" "$maxclients" "$redis_dir" <<'PY'
 import json, os, tempfile
 from datetime import datetime
-with open('$STATE_FILE') as f:
+import sys
+
+state_path, user, memory_mb, maxclients, redis_dir = sys.argv[1:6]
+with open(state_path) as f:
     state = json.load(f)
-existing = state.get('$user', {})
-state['$user'] = {
-    'memory_mb': $memory_mb,
-    'maxclients': $maxclients,
+existing = state.get(user, {})
+state[user] = {
+    'memory_mb': int(memory_mb),
+    'maxclients': int(maxclients),
     'enabled_at': existing.get('enabled_at', datetime.now().isoformat())
 }
+if redis_dir:
+    state[user]['redis_dir'] = redis_dir
+elif existing.get('redis_dir'):
+    state[user]['redis_dir'] = existing['redis_dir']
 # Atomic write: temp file + rename avoids partial writes
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname('$STATE_FILE'))
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state_path))
 with os.fdopen(fd, 'w') as f:
     json.dump(state, f, indent=2)
-os.rename(tmp, '$STATE_FILE')
-"
+os.chmod(tmp, 0o644)
+os.replace(tmp, state_path)
+PY
 }
 
 state_remove() {
@@ -117,6 +130,7 @@ state.pop('$user', None)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname('$STATE_FILE'))
 with os.fdopen(fd, 'w') as f:
     json.dump(state, f, indent=2)
+os.chmod(tmp, 0o644)
 os.rename(tmp, '$STATE_FILE')
 "
 }
@@ -129,6 +143,15 @@ with open('$STATE_FILE') as f:
 total = sum(u.get('memory_mb', $DEFAULT_MEMORY_MB) for u in state.values())
 print(total)
 "
+}
+
+state_redis_dir() {
+    local user="$1"
+    local redis_dir=""
+    eval "$(state_get "$user" 2>/dev/null)" || return 1
+    if [[ -n "${redis_dir:-}" ]]; then
+        printf '%s\n' "$redis_dir"
+    fi
 }
 
 state_list_users() {
@@ -226,6 +249,112 @@ validate_memory_mb() {
         echo "ERROR: memory_mb must be between 16 and 1024" >&2
         exit 1
     fi
+}
+
+site_isolation_enabled() {
+    local user="$1"
+    local output
+
+    output="$("$CAGEFSCTL" --site-isolation-list "$user" 2>/dev/null || true)"
+    [[ -n "$output" ]] || return 1
+
+    if grep -Eq '^[[:space:]]*[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}' <<<"$output"; then
+        return 0
+    fi
+
+    return 1
+}
+
+desired_redis_dir() {
+    local user="$1"
+    if site_isolation_enabled "$user"; then
+        printf '/home/%s/%s\n' "$user" "$ISOLATED_REDIS_DIR"
+    else
+        printf '/home/%s/%s\n' "$user" "$LEGACY_REDIS_DIR"
+    fi
+}
+
+alternate_redis_dir() {
+    local user="$1"
+    local desired
+    desired="$(desired_redis_dir "$user")"
+    if [[ "$desired" == "/home/${user}/${LEGACY_REDIS_DIR}" ]]; then
+        printf '/home/%s/%s\n' "$user" "$ISOLATED_REDIS_DIR"
+    else
+        printf '/home/%s/%s\n' "$user" "$LEGACY_REDIS_DIR"
+    fi
+}
+
+current_redis_dir() {
+    local user="$1"
+    local desired alternate stored
+    local desired_socket alternate_socket
+
+    stored="$(state_redis_dir "$user" || true)"
+    if [[ -n "$stored" ]]; then
+        printf '%s\n' "$stored"
+        return 0
+    fi
+
+    desired="$(desired_redis_dir "$user")"
+    desired_socket="${desired}/${SOCKET_NAME}"
+    alternate="$(alternate_redis_dir "$user")"
+    alternate_socket="${alternate}/${SOCKET_NAME}"
+
+    if [[ -S "$desired_socket" || -e "$desired_socket" ]]; then
+        printf '%s\n' "$desired"
+        return 0
+    fi
+
+    if [[ -S "$alternate_socket" || -e "$alternate_socket" ]]; then
+        printf '%s\n' "$alternate"
+        return 0
+    fi
+
+    if [[ -d "$desired" ]]; then
+        printf '%s\n' "$desired"
+        return 0
+    fi
+
+    if [[ -d "$alternate" ]]; then
+        printf '%s\n' "$alternate"
+        return 0
+    fi
+
+    printf '%s\n' "$desired"
+}
+
+current_redis_socket() {
+    local user="$1"
+    printf '%s/%s\n' "$(current_redis_dir "$user")" "$SOCKET_NAME"
+}
+
+ensure_redis_dir_layout() {
+    local user="$1"
+    local desired alternate
+    desired="$(desired_redis_dir "$user")"
+    alternate="$(alternate_redis_dir "$user")"
+
+    mkdir -p "$desired"
+    if [[ -d "$alternate" ]]; then
+        local moved=0
+        while IFS= read -r -d '' item; do
+            [[ -e "$item" ]] || continue
+            local base
+            base="$(basename "$item")"
+            [[ "$base" == "redis.conf" ]] && continue
+            mv -f "$item" "$desired/"
+            moved=1
+        done < <(find "$alternate" -mindepth 1 -maxdepth 1 -print0 2>/dev/null || true)
+
+        rmdir "$alternate" 2>/dev/null || true
+        if [[ $moved -eq 1 ]]; then
+            log "Migrated Redis runtime files for ${user} into $desired"
+        fi
+    fi
+
+    chown -R "${user}:${user}" "$desired"
+    chmod 750 "$desired"
 }
 
 check_budget() {
@@ -346,11 +475,12 @@ remove_session_locking() {
 # --- Helpers ---
 
 regenerate_config() {
-    local user="$1" memory_mb="$2" mc="$3"
-    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
+    local user="$1" redis_dir="$2" memory_mb="$3" mc="$4"
     local conf_file="${redis_dir}/redis.conf"
 
+    mkdir -p "$redis_dir"
     sed -e "s|{{USERNAME}}|${user}|g" \
+        -e "s|{{REDIS_DIR}}|${redis_dir}|g" \
         -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
         -e "s|{{MAXCLIENTS}}|${mc}|g" \
         "$TEMPLATE_FILE" > "$conf_file"
@@ -365,25 +495,19 @@ render_systemd_unit() {
         exit 1
     }
 
-    local exec_start
-    if [[ "$USE_CAGEFS" == "true" ]]; then
-        exec_start="${CAGEFS_ENTER} ${REDIS_BINARY} /home/%i/${USER_REDIS_DIR}/redis.conf"
-    else
-        exec_start="${REDIS_BINARY} /home/%i/${USER_REDIS_DIR}/redis.conf"
-    fi
+    local launcher="${SCRIPT_DIR}/bin/redismanager-ctl launch %i"
 
-    python3 - "$SYSTEMD_TEMPLATE" "$SYSTEMD_UNIT" "$exec_start" "$USER_REDIS_DIR" <<'PY'
+    python3 - "$SYSTEMD_TEMPLATE" "$SYSTEMD_UNIT" "$launcher" <<'PY'
 import os
 import sys
 import tempfile
 
-template_path, output_path, exec_start, user_redis_dir = sys.argv[1:5]
+template_path, output_path, launcher = sys.argv[1:4]
 
 with open(template_path, "r", encoding="utf-8") as fh:
     content = fh.read()
 
-content = content.replace("{{EXEC_START}}", exec_start)
-content = content.replace("{{USER_REDIS_DIR}}", user_redis_dir)
+content = content.replace("{{LAUNCHER}}", launcher)
 
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(output_path))
 try:
@@ -461,9 +585,11 @@ is_joomla_config() {
 
 switch_joomla_managed_redis() {
     local file="$1" user="$2"
-    local redis_socket="/home/${user}/${USER_REDIS_DIR}/${SOCKET_NAME}"
+    local desired_socket alternate_socket
+    desired_socket="$(desired_redis_dir "$user")/${SOCKET_NAME}"
+    alternate_socket="$(alternate_redis_dir "$user")/${SOCKET_NAME}"
 
-    python3 - "$file" "$redis_socket" <<'PY'
+    python3 - "$file" "$desired_socket" "$alternate_socket" <<'PY'
 import os
 import re
 import shutil
@@ -472,7 +598,7 @@ import sys
 import tempfile
 
 path = sys.argv[1]
-redis_socket = sys.argv[2]
+managed_sockets = {socket for socket in sys.argv[2:] if socket}
 backup_path = path + ".redismanager.bak"
 
 with open(path, "r", encoding="utf-8") as fh:
@@ -484,8 +610,8 @@ original_stat = os.stat(path)
 prop_re = re.compile(r"^(\s*public\s+\$([A-Za-z0-9_]+)\s*=\s*)(['\"])(.*?)(\3\s*;\s*)$", re.MULTILINE)
 props = {m.group(2): m.group(4) for m in prop_re.finditer(original)}
 
-cache_uses_managed = props.get("cache_handler", "").lower() == "redis" and props.get("redis_server_host", "") == redis_socket
-session_uses_managed = props.get("session_handler", "").lower() == "redis" and props.get("session_redis_server_host", "") == redis_socket
+cache_uses_managed = props.get("cache_handler", "").lower() == "redis" and props.get("redis_server_host", "") in managed_sockets
+session_uses_managed = props.get("session_handler", "").lower() == "redis" and props.get("session_redis_server_host", "") in managed_sockets
 
 if not cache_uses_managed and not session_uses_managed:
     print("unchanged")
@@ -583,20 +709,12 @@ cmd_enable() {
     # Check budget
     check_budget "$memory_mb"
 
-    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
-    local conf_file="${redis_dir}/redis.conf"
-
-    # Create directory
-    mkdir -p "$redis_dir"
-
     local maxclients="${DEFAULT_MAXCLIENTS}"
+    local redis_dir
+    redis_dir="$(desired_redis_dir "$user")"
 
     # Generate config from template
-    regenerate_config "$user" "$memory_mb" "$maxclients"
-
-    # Set permissions
-    chown -R "${user}:${user}" "$redis_dir"
-    chmod 750 "$redis_dir"
+    regenerate_config "$user" "$redis_dir" "$memory_mb" "$maxclients"
 
     # Enable and start systemd service
     systemctl enable "redis-managed@${user}" --quiet 2>/dev/null
@@ -643,10 +761,10 @@ cmd_disable() {
     systemctl disable "redis-managed@${user}" --quiet 2>/dev/null || true
 
     # Remove data directory
-    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
-    if [[ -d "$redis_dir" ]]; then
-        rm -rf "$redis_dir"
-    fi
+    local legacy_dir="/home/${user}/${LEGACY_REDIS_DIR}"
+    local isolated_dir="/home/${user}/${ISOLATED_REDIS_DIR}"
+    [[ -d "$legacy_dir" ]] && rm -rf "$legacy_dir"
+    [[ -d "$isolated_dir" ]] && rm -rf "$isolated_dir"
 
     # Remove .user.ini session locking entries
     remove_session_locking "$user"
@@ -667,6 +785,9 @@ cmd_restart() {
         exit 1
     fi
 
+    eval "$(state_get "$user")"
+    local redis_dir="${redis_dir:-$(desired_redis_dir "$user")}"
+    state_set "$user" "${memory:-$DEFAULT_MEMORY_MB}" "${maxclients:-$DEFAULT_MAXCLIENTS}" "$redis_dir"
     systemctl restart "redis-managed@${user}"
     log "RESTARTED Redis for user=$user"
     echo "Redis restarted for '$user'"
@@ -675,8 +796,8 @@ cmd_restart() {
 cmd_status() {
     local user="$1"
     validate_username_format "$user"
-    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
-    local socket="${redis_dir}/${SOCKET_NAME}"
+    local socket
+    socket="$(current_redis_socket "$user")"
 
     echo "=== Redis Status for '$user' ==="
 
@@ -721,8 +842,8 @@ cmd_status() {
 cmd_flush() {
     local user="$1"
     validate_username_format "$user"
-    local redis_dir="/home/${user}/${USER_REDIS_DIR}"
-    local socket="${redis_dir}/${SOCKET_NAME}"
+    local socket
+    socket="$(current_redis_socket "$user")"
 
     if [[ ! -S "$socket" ]]; then
         echo "ERROR: Socket not found: $socket" >&2
@@ -750,15 +871,19 @@ cmd_set_memory() {
     eval "$(state_get "$user")"
     local current_alloc="${memory}"
     local current_maxclients="${maxclients:-$DEFAULT_MAXCLIENTS}"
+    local current_redis_dir="${redis_dir:-}"
     local delta=$((memory_mb - current_alloc))
     if [[ $delta -gt 0 ]]; then
         check_budget "$delta"
     fi
 
-    regenerate_config "$user" "$memory_mb" "$current_maxclients"
+    local redis_dir
+    redis_dir="${current_redis_dir:-$(desired_redis_dir "$user")}"
+
+    regenerate_config "$user" "$redis_dir" "$memory_mb" "$current_maxclients"
 
     # Update state and restart
-    state_set "$user" "$memory_mb" "$current_maxclients"
+    state_set "$user" "$memory_mb" "$current_maxclients" "$redis_dir"
     systemctl restart "redis-managed@${user}"
 
     log "SET-MEMORY Redis for user=$user to ${memory_mb}MB"
@@ -783,11 +908,15 @@ cmd_set_maxclients() {
 
     eval "$(state_get "$user")"
     local current_memory="${memory}"
+    local current_redis_dir="${redis_dir:-}"
 
-    regenerate_config "$user" "$current_memory" "$new_maxclients"
+    local redis_dir
+    redis_dir="${current_redis_dir:-$(desired_redis_dir "$user")}"
+
+    regenerate_config "$user" "$redis_dir" "$current_memory" "$new_maxclients"
 
     # Update state and restart
-    state_set "$user" "$current_memory" "$new_maxclients"
+    state_set "$user" "$current_memory" "$new_maxclients" "$redis_dir"
     systemctl restart "redis-managed@${user}"
 
     log "SET-MAXCLIENTS Redis for user=$user to ${new_maxclients}"
@@ -818,7 +947,8 @@ cmd_list() {
             mc="${maxclients:-$DEFAULT_MAXCLIENTS}"
         fi
 
-        local socket="/home/${user}/${USER_REDIS_DIR}/${SOCKET_NAME}"
+        local socket
+        socket="$(current_redis_socket "$user")"
         printf "%-20s %-8s %-10s %-8s %-20s %s\n" "$user" "${mem}MB" "$mc" "$status" "$enabled_at" "$socket"
     done < <(state_list_users)
 
@@ -866,6 +996,34 @@ cmd_render_unit() {
     render_systemd_unit
     systemctl daemon-reload
     echo "Rendered ${SYSTEMD_UNIT} using ${REDIS_BINARY}"
+}
+
+cmd_launch() {
+    local user="$1"
+    validate_user "$user"
+    validate_binary
+
+    local memory_mb="$DEFAULT_MEMORY_MB"
+    local maxclients="$DEFAULT_MAXCLIENTS"
+    local redis_dir=""
+
+    if state_get "$user" &>/dev/null; then
+        eval "$(state_get "$user")"
+        memory_mb="${memory:-$DEFAULT_MEMORY_MB}"
+        maxclients="${maxclients:-$DEFAULT_MAXCLIENTS}"
+        redis_dir="${redis_dir:-}"
+    fi
+
+    ensure_redis_dir_layout "$user"
+
+    redis_dir="${redis_dir:-$(desired_redis_dir "$user")}"
+    regenerate_config "$user" "$redis_dir" "$memory_mb" "$maxclients"
+
+    if [[ "$USE_CAGEFS" == "true" ]]; then
+        exec "$CAGEFS_ENTER" "$REDIS_BINARY" "$redis_dir/redis.conf"
+    fi
+
+    exec "$REDIS_BINARY" "$redis_dir/redis.conf"
 }
 
 cmd_apply_binary() {
@@ -960,6 +1118,10 @@ case "$CMD" in
         ;;
     render-unit)
         cmd_render_unit
+        ;;
+    launch)
+        [[ $# -lt 1 ]] && { echo "Usage: $(basename "$0") launch <username>"; exit 1; }
+        cmd_launch "$@"
         ;;
     *)
         echo "Unknown command: $CMD" >&2

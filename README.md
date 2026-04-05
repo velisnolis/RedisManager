@@ -24,14 +24,38 @@ Built primarily for **Joomla** sites that can't use AccelerateWP, but works for 
 - Runs a **health check cron** every 5 minutes to restart failed instances
 - Enforces a **global memory budget** (default: 2 GB) to prevent overcommitting server RAM
 - Uses **file locking** (`flock`) on the state file to prevent corruption from concurrent access (WHM, CLI, cron, hooks)
+- Adapts to **CloudLinux site isolation** automatically: isolated accounts use `~/.clwpos/redismanager/`, while normal accounts keep `~/.redis-managed/`
 
 ## What it does NOT do
 
 - **Does not install its own Redis binary.** It expects an existing Redis or Valkey server binary on the host. By default this is usually CloudLinux `alt-redis`, but the binary is selectable from the global configuration panel.
-- **Does not interfere with AccelerateWP.** WordPress sites managed by AccelerateWP continue to work as before. RedisManager uses a separate directory (`~/.redis-managed/`) and AccelerateWP's monitoring daemon ignores our instances (verified by code inspection of `clwpos_monitoring`'s `_validate_redis_proc()` — it specifically checks for `.clwpos/redis.sock` in the process cmdline).
+- **Does not interfere with AccelerateWP.** WordPress sites managed by AccelerateWP continue to work as before. RedisManager uses a separate directory for each mode (`~/.redis-managed/` for normal accounts, `~/.clwpos/redismanager/` for CloudLinux site-isolated accounts) and AccelerateWP's monitoring daemon ignores our instances (verified by code inspection of `clwpos_monitoring`'s `_validate_redis_proc()` — it specifically checks for `.clwpos/redis.sock` in the process cmdline).
 - **Does not configure your CMS automatically on enable.** After enabling Redis for a user, you must manually configure the CMS (Joomla, Drupal, etc.) to use the Redis socket. Instructions are shown in the WHM interface. On disable, RedisManager now tries to switch Joomla sites using the managed socket back to `file` cache and `database` sessions first, to avoid leaving the site with 500 errors.
 - **Does not provide Redis Cluster, Sentinel, or replication.** Each instance is a standalone, single-node Redis server running in cache-only mode (no persistence).
 - **Does not manage AccelerateWP instances.** WordPress Redis managed by AccelerateWP is completely separate and should be managed through CloudLinux's own tools.
+
+## CloudLinux site isolation
+
+CloudLinux's **site isolation** changes the filesystem view of a domain. A Joomla site running inside an isolated domain can access the RedisManager socket only if that socket lives in a path visible from that isolated context.
+
+RedisManager handles this by choosing the socket directory per account type:
+
+- **Normal accounts:** `/home/<username>/.redis-managed/`
+- **Site-isolated accounts:** `/home/<username>/.clwpos/redismanager/`
+
+What this change does:
+
+- Keeps the connection model on **Unix sockets only**
+- Lets RedisManager work with **Joomla on site-isolated domains**
+- Preserves the existing per-user model for non-isolated accounts
+- Shows the socket scope in the WHM admin as `isolated` or `legacy`
+
+What this change does not do:
+
+- It does **not** use TCP as a fallback
+- It does **not** move Redis into `public_html`
+- It does **not** auto-edit Joomla configuration for you
+- It does **not** change how AccelerateWP manages WordPress Redis
 
 ## Requirements
 
@@ -168,10 +192,14 @@ redismanager-ctl info
 
 After enabling Redis for a user, configure Joomla at **System → Global Configuration → System**:
 
+> Socket path depends on the account type:
+> - Normal accounts: `/home/<username>/.redis-managed/redis.sock`
+> - CloudLinux site-isolated accounts: `/home/<username>/.clwpos/redismanager/redis.sock`
+
 | Setting | Value |
 |---|---|
 | Cache Handler | `Redis` |
-| Redis Server Host | `/home/<username>/.redis-managed/redis.sock` |
+| Redis Server Host | `See note above` |
 | Redis Server Port | `6379` *(default — ignored when using a socket, but Joomla requires a valid port number)* |
 | Redis Server Database | `0` |
 | Redis Persistent | `Yes` *(recommended — reuses PHP connections, reduces overhead)* |
@@ -182,7 +210,7 @@ For sessions (**System → Global Configuration → System → Session**):
 | Setting | Value |
 |---|---|
 | Session Handler | `Redis` |
-| Redis Server Host | `/home/<username>/.redis-managed/redis.sock` |
+| Redis Server Host | `See note above` |
 | Redis Server Port | `6379` |
 | Redis Server Database | `1` *(separate DB from cache)* |
 | Redis Persistent | `Yes` |
@@ -222,7 +250,7 @@ redis.session.lock_wait_time = 10000
 
 ### Automatic Joomla fallback on disable
 
-Before a managed Redis instance is disabled, RedisManager scans the user's home for Joomla `configuration.php` files. If a config is actively using the managed socket (`/home/<user>/.redis-managed/redis.sock`), it switches:
+Before a managed Redis instance is disabled, RedisManager scans the user's home for Joomla `configuration.php` files. If a config is actively using the managed socket for that account (`/home/<user>/.redis-managed/redis.sock` or `/home/<user>/.clwpos/redismanager/redis.sock`), it switches:
 
 - `cache_handler` from `redis` to `file`
 - `session_handler` from `redis` to `database`
@@ -235,16 +263,16 @@ The original file is preserved as `configuration.php.redismanager.bak`. Only Joo
 
 The default `maxclients` is **128**, which is suitable for most shared hosting accounts. If you see `ERR max number of clients reached` in the Redis log or `session_write_close() failed` errors:
 
-1. Check current connections: `redis-cli -s /home/<user>/.redis-managed/redis.sock INFO clients`
+1. Check current connections: `redis-cli -s /home/<user>/.redis-managed/redis.sock INFO clients` or `redis-cli -s /home/<user>/.clwpos/redismanager/redis.sock INFO clients`
 2. Increase if needed: `redismanager-ctl set-maxclients <user> 256`
 
 **Why this matters:** With Joomla's `redis_persist = true` (persistent connections), each PHP/LSAPI worker maintains an open connection to Redis. Under normal traffic with frontend visitors, admin users, bots, and subdomains all hitting the same account, you can easily have 20-50 simultaneous workers. The old default of 16 was too low and caused systematic 500 errors.
 
 ### Other CMS / Frameworks
 
-Any application that supports Redis via Unix sockets can use the managed instance. The connection details are always:
+Any application that supports Redis via Unix sockets can use the managed instance. The connection details are always socket-based, but the path depends on whether the account uses CloudLinux site isolation:
 
-- **Socket:** `/home/<username>/.redis-managed/redis.sock`
+- **Socket:** `/home/<username>/.redis-managed/redis.sock` or `/home/<username>/.clwpos/redismanager/redis.sock`
 - **Port:** not applicable (socket connection)
 - **Password:** none
 - **Databases:** 0 and 1 available (2 databases configured by default)
@@ -286,7 +314,8 @@ redismanager-ctl apply-binary /path/to/redis-server-or-valkey-server
 /var/log/redismanager/                # Plugin, hook, and health check logs
 
 Per user (created on enable, removed on disable):
-/home/<user>/.redis-managed/
+/home/<user>/.redis-managed/            # normal accounts
+/home/<user>/.clwpos/redismanager/      # CloudLinux site-isolated accounts
 ├── redis.conf                        # Auto-generated Redis config
 ├── redis.sock                        # Unix socket (permissions 600)
 ├── redis.pid                         # PID file
@@ -316,8 +345,8 @@ The state file (`state.json`) is accessed by four independent processes: the CLI
 
 | | AccelerateWP (WordPress) | RedisManager |
 |---|---|---|
-| Directory | `~/.clwpos/` | `~/.redis-managed/` |
-| Socket | `~/.clwpos/redis.sock` | `~/.redis-managed/redis.sock` |
+| Directory | `~/.clwpos/` | `~/.redis-managed/` or `~/.clwpos/redismanager/` |
+| Socket | `~/.clwpos/redis.sock` | `~/.redis-managed/redis.sock` or `~/.clwpos/redismanager/redis.sock` |
 | Manager | `clwpos_monitoring` daemon | systemd + cron health check |
 | Binary | `/opt/alt/redis/bin/redis-server` | Same binary |
 

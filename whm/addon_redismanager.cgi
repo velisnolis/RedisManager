@@ -19,6 +19,7 @@ use JSON::PP;
 my $CTL       = '/opt/redismanager/bin/redismanager-ctl';
 my $STATE     = '/var/lib/redismanager/state.json';
 my $CONF_FILE = '/opt/redismanager/etc/redismanager.conf';
+my $CAGEFSCTL = '/usr/sbin/cagefsctl';
 my $VERSION   = '0.3.0';
 
 # --- WHM Auth ---
@@ -282,6 +283,33 @@ sub binary_friendly_name {
     return $name;
 }
 
+sub site_isolation_enabled_for_user {
+    my ($user) = @_;
+    return 0 unless -x $CAGEFSCTL;
+
+    my $output = `$CAGEFSCTL --site-isolation-list '$user' 2>/dev/null`;
+    return ($output =~ /^\s*[A-Za-z0-9][A-Za-z0-9.-]*\.[A-Za-z]{2,}/m) ? 1 : 0;
+}
+
+sub redis_dir_for_user {
+    my ($user) = @_;
+    return site_isolation_enabled_for_user($user)
+        ? "/home/${user}/.clwpos/redismanager"
+        : "/home/${user}/.redis-managed";
+}
+
+sub redis_socket_for_user {
+    my ($user) = @_;
+    my $preferred = redis_dir_for_user($user) . '/redis.sock';
+    my $alternate = (site_isolation_enabled_for_user($user)
+        ? "/home/${user}/.redis-managed/redis.sock"
+        : "/home/${user}/.clwpos/redismanager/redis.sock");
+
+    return $preferred if -S $preferred || -e $preferred;
+    return $alternate if -S $alternate || -e $alternate;
+    return $preferred;
+}
+
 sub is_service_active {
     my ($user) = @_;
     system("systemctl is-active --quiet 'redis-managed\@${user}' 2>/dev/null");
@@ -332,9 +360,15 @@ sub print_page {
     .rm-detail-panel .rm-section { margin-bottom: 12px; }
     .rm-detail-panel .rm-section:last-child { margin-bottom: 0; }
     .rm-detail-panel h4 { margin: 0 0 6px; font-size: 13px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }
-    .rm-detail-panel .rm-info-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 4px 20px; font-size: 13px; }
-    .rm-detail-panel .rm-info-grid .rm-label { color: #888; }
+    .rm-detail-panel .rm-info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px 24px; font-size: 13px; }
+    .rm-detail-panel .rm-info-grid > div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .rm-detail-panel .rm-info-grid .rm-label { color: #888; display: block; }
+    .rm-detail-panel .rm-info-grid .rm-value { display: block; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+    .rm-detail-panel .rm-badge { display: inline-block; width: fit-content; padding: 2px 8px; border-radius: 999px; font-size: 11px; line-height: 1.4; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px; }
+    .rm-detail-panel .rm-badge-isolated { background: #e2f5ea; color: #20734b; }
+    .rm-detail-panel .rm-badge-legacy { background: #eef2f7; color: #5d6b7a; }
     .rm-detail-panel .rm-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .rm-socket { font-family: monospace; font-size: 0.85em; color: #555; overflow-wrap: anywhere; word-break: break-word; }
 
     /* Global config panel */
     .rm-config-panel { background: #f5f7fa; border: 1px solid #d9dee4; border-radius: 4px; padding: 15px 20px; margin-bottom: 20px; }
@@ -348,7 +382,7 @@ sub print_page {
     .rm-config-field label { font-size: 12px; color: #666; }
     .rm-config-field input { width: 80px; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; text-align: center; }
     .rm-config-field select { width: 100%; min-width: 220px; max-width: 100%; padding: 4px 6px; border: 1px solid #bbb; border-radius: 3px; }
-    .rm-config-help { min-height: 64px; padding: 8px 10px; border: 1px solid #d9dee4; border-radius: 4px; background: #fff; font-size: 12px; line-height: 1.45; color: #555; }
+    .rm-config-help { min-height: 64px; padding: 8px 10px; border: 1px solid #d9dee4; border-radius: 4px; background: #fff; font-size: 12px; line-height: 1.45; color: #555; overflow-wrap: anywhere; word-break: break-word; }
     .rm-config-help code { font-size: 11px; background: #eef3f8; padding: 1px 4px; border-radius: 3px; }
     .rm-config-help .rm-help-title { display: block; font-weight: 600; color: #333; margin-bottom: 3px; }
 </style>
@@ -544,7 +578,10 @@ HTML
 
         # Expandable detail row (only for managed accounts)
         if ($is_managed) {
-            my $socket = "/home/$user/.redis-managed/redis.sock";
+            my $socket = redis_socket_for_user($user);
+            my $isolated = site_isolation_enabled_for_user($user);
+            my $scope_label = $isolated ? 'isolated' : 'legacy';
+            my $scope_class = $isolated ? 'rm-badge-isolated' : 'rm-badge-legacy';
             my $enabled_at = html_escape($state->{$user}{enabled_at} // 'unknown');
 
             print qq{<tr id="detail-$user" class="rm-detail-row" style="display:none"><td colspan="8" class="tdshade2">};
@@ -553,16 +590,17 @@ HTML
             # Info section
             print qq{<div class="rm-section"><h4>Connection</h4>};
             print qq{<div class="rm-info-grid">};
-            print qq{<div><span class="rm-label">Socket:</span> <span class="rm-socket">$socket</span></div>};
-            print qq{<div><span class="rm-label">Enabled:</span> $enabled_at</div>};
+            print qq{<div><span class="rm-label">Socket:</span> <span class="rm-value rm-socket">$socket</span></div>};
+            print qq{<div><span class="rm-label">Scope:</span> <span class="rm-value"><span class="rm-badge $scope_class">$scope_label</span></span></div>};
+            print qq{<div><span class="rm-label">Enabled:</span> <span class="rm-value">$enabled_at</span></div>};
             print qq{</div>};
             print qq{</div>};
 
             # Joomla config section
             print qq{<div class="rm-section"><h4>Joomla Configuration</h4>};
             print qq{<div class="rm-info-grid">};
-            print qq{<div><span class="rm-label">Cache:</span> Handler=Redis, Host=$socket, Port=6379, DB=0</div>};
-            print qq{<div><span class="rm-label">Sessions:</span> Handler=Redis, Host=$socket, Port=6379, DB=1</div>};
+            print qq{<div><span class="rm-label">Cache:</span> <span class="rm-value">Handler=Redis, Host=$socket, Port=6379, DB=0</span></div>};
+            print qq{<div><span class="rm-label">Sessions:</span> <span class="rm-value">Handler=Redis, Host=$socket, Port=6379, DB=1</span></div>};
             print qq{</div>};
             print qq{</div>};
 

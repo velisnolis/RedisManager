@@ -4,7 +4,7 @@
 # Network: socket-only, no TCP
 bind 127.0.0.1
 port 0
-unixsocket /home/{{USERNAME}}/.redis-managed/redis.sock
+unixsocket {{REDIS_DIR}}/redis.sock
 unixsocketperm 600
 
 # Limits
@@ -19,9 +19,9 @@ appendonly no
 
 # Process
 daemonize no
-pidfile /home/{{USERNAME}}/.redis-managed/redis.pid
-dir /home/{{USERNAME}}/.redis-managed
+pidfile {{REDIS_DIR}}/redis.pid
+dir {{REDIS_DIR}}
 
 # Logging
 loglevel warning
-logfile /home/{{USERNAME}}/.redis-managed/redis.log
+logfile {{REDIS_DIR}}/redis.log
