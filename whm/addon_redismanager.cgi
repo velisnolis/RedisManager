@@ -24,7 +24,7 @@ my $STATE     = '/var/lib/redismanager/state.json';
 my $CONF_FILE = '/opt/redismanager/etc/redismanager.conf';
 my $CONF_LOCK = '/var/run/redismanager-config.lock';
 my $CAGEFSCTL = '/usr/sbin/cagefsctl';
-my $VERSION   = '0.3.0';
+my $VERSION   = '0.3.1';
 
 # --- WHM Auth ---
 Whostmgr::ACLS::init_acls();

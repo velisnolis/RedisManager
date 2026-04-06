@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-04-06
+
+### Changed
+
+- Hardened `redismanager-ctl` so state parsing no longer relies on `eval`, and restricted the CLI to `root`.
+- Serialized budget-sensitive operations and made config writes atomic in both the CLI and WHM config save flow.
+- Refused unsafe writes through symlinks or paths outside `/home/$user` when managing Redis config, `.user.ini`, and Joomla fallback rewrites.
+- Tightened install-time permissions for state, logs, and runtime scripts, and added a `logrotate` policy for RedisManager logs.
+- Added restart throttling to the healthcheck cron so a flapping instance is not restarted forever.
+
+### Validated
+
+- Local shell syntax checks passed for `redismanager-ctl`, `redismanager-healthcheck`, `redismanager-hooks`, `install.sh`, and `uninstall.sh`.
+- Production validation on `server.miras.pro` passed after targeted deploy, including WHM CGI syntax, `redismanager-ctl info/list/status`, manual healthcheck execution, and verification that all managed Redis instances remained active.
+
 ## 2026-04-05
 
 ### Changed
