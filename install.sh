@@ -2,6 +2,7 @@
 # RedisManager — installer for CloudLinux + cPanel servers
 # Run as root: bash install.sh
 set -euo pipefail
+umask 027
 
 INSTALL_DIR="/opt/redismanager"
 STATE_DIR="/var/lib/redismanager"
@@ -10,6 +11,7 @@ WHM_CGI="/usr/local/cpanel/whostmgr/docroot/cgi/addon_redismanager.cgi"
 APPCONFIG="/var/cpanel/apps/addon_redismanager.conf"
 LEGACY_APPCONFIG="/var/cpanel/apps/redismanager.conf"
 CRON_FILE="/etc/cron.d/redismanager"
+LOGROTATE_FILE="/etc/logrotate.d/redismanager"
 
 echo "=== RedisManager Installer ==="
 
@@ -33,6 +35,7 @@ fi
 echo "[1/7] Installing files to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"/{bin,etc,templates,hooks,cron}
 mkdir -p "$STATE_DIR" "$LOG_DIR"
+chmod 750 "$STATE_DIR" "$LOG_DIR"
 
 # Copy files from source directory (same dir as this script)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -40,19 +43,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cp "$SCRIPT_DIR/bin/redismanager-ctl"             "$INSTALL_DIR/bin/"
 cp "$SCRIPT_DIR/etc/redismanager.conf"            "$INSTALL_DIR/etc/"
 cp "$SCRIPT_DIR/templates/redis-user.conf.tmpl"   "$INSTALL_DIR/templates/"
+cp "$SCRIPT_DIR/templates/redismanager.logrotate" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/hooks/redismanager-hooks"         "$INSTALL_DIR/hooks/"
 cp "$SCRIPT_DIR/cron/redismanager-healthcheck"    "$INSTALL_DIR/cron/"
 
-chmod +x "$INSTALL_DIR/bin/redismanager-ctl"
-chmod +x "$INSTALL_DIR/hooks/redismanager-hooks"
-chmod +x "$INSTALL_DIR/cron/redismanager-healthcheck"
+chmod 750 "$INSTALL_DIR/bin/redismanager-ctl"
+chmod 750 "$INSTALL_DIR/hooks/redismanager-hooks"
+chmod 750 "$INSTALL_DIR/cron/redismanager-healthcheck"
 chmod 644 "$INSTALL_DIR/etc/redismanager.conf"
+chmod 644 "$INSTALL_DIR/templates/redismanager.logrotate"
 
 # Initialize state file if not present
 if [[ ! -f "$STATE_DIR/state.json" ]]; then
     echo '{}' > "$STATE_DIR/state.json"
 fi
-chmod 644 "$STATE_DIR/state.json"
+chmod 640 "$STATE_DIR/state.json"
 
 echo "[2/7] Installing systemd template unit..."
 cp "$SCRIPT_DIR/templates/redis-managed.service" "$INSTALL_DIR/templates/"
@@ -85,6 +90,11 @@ cat > "$CRON_FILE" <<EOF
 # RedisManager health check — every 5 minutes
 */5 * * * * root $INSTALL_DIR/cron/redismanager-healthcheck
 EOF
+chmod 644 "$CRON_FILE"
+
+echo "[5.1/7] Installing logrotate policy..."
+cp "$INSTALL_DIR/templates/redismanager.logrotate" "$LOGROTATE_FILE"
+chmod 644 "$LOGROTATE_FILE"
 
 echo "[6/7] Creating convenience symlink..."
 ln -sf "$INSTALL_DIR/bin/redismanager-ctl" /usr/local/sbin/redismanager-ctl

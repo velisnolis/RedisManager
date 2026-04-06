@@ -14,11 +14,15 @@ BEGIN {
 use Whostmgr::ACLS          ();
 use Whostmgr::HTMLInterface ();
 use CGI;
+use Fcntl qw(:flock);
+use File::Basename qw(dirname);
+use File::Temp qw(tempfile);
 use JSON::PP;
 
 my $CTL       = '/opt/redismanager/bin/redismanager-ctl';
 my $STATE     = '/var/lib/redismanager/state.json';
 my $CONF_FILE = '/opt/redismanager/etc/redismanager.conf';
+my $CONF_LOCK = '/var/run/redismanager-config.lock';
 my $CAGEFSCTL = '/usr/sbin/cagefsctl';
 my $VERSION   = '0.3.0';
 
@@ -145,7 +149,10 @@ sub save_global_config {
         return ('Invalid Redis binary path', 'error');
     }
 
-    # Read current config
+    open my $lockfh, '>>', $CONF_LOCK or return ("Cannot open config lock: $!", 'error');
+    flock($lockfh, LOCK_EX) or return ("Cannot lock config: $!", 'error');
+
+    # Read current config while holding the writer lock
     open my $fh, '<', $CONF_FILE or return ("Cannot read config: $!", 'error');
     my @lines = <$fh>;
     close $fh;
@@ -163,9 +170,13 @@ sub save_global_config {
         }
     }
 
-    open my $wfh, '>', $CONF_FILE or return ("Cannot write config: $!", 'error');
-    print $wfh @lines;
-    close $wfh;
+    my ($wfh, $tmpfile) = tempfile('redismanager-conf-XXXXXX', DIR => dirname($CONF_FILE), UNLINK => 0);
+    print {$wfh} @lines or return ("Cannot write temp config: $!", 'error');
+    close $wfh or return ("Cannot close temp config: $!", 'error');
+    chmod 0644, $tmpfile;
+    rename $tmpfile, $CONF_FILE or return ("Cannot replace config: $!", 'error');
+
+    close $lockfh;
 
     if ($new_bin && ($existing_conf{REDIS_BINARY} // '') ne $new_bin) {
         my $output = `$CTL apply-binary '$new_bin' 2>&1`;

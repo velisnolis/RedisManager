@@ -9,8 +9,19 @@ TEMPLATE_FILE="${SCRIPT_DIR}/templates/redis-user.conf.tmpl"
 SYSTEMD_TEMPLATE="${SCRIPT_DIR}/templates/redis-managed.service"
 SYSTEMD_UNIT="/etc/systemd/system/redis-managed@.service"
 LOCK_FILE="/var/run/redismanager-state.lock"
+CONFIG_LOCK_FILE="/var/run/redismanager-config.lock"
+BUDGET_LOCK_FILE="/var/run/redismanager-budget.lock"
 LEGACY_REDIS_DIR=".redis-managed"
 ISOLATED_REDIS_DIR=".clwpos/redismanager"
+
+umask 027
+
+# The control script manages global state, systemd units, and root-owned files.
+# Keep it root-only so local users cannot introspect or poke internal operations.
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: Must run as root" >&2
+    exit 1
+fi
 
 # Load configuration
 if [[ ! -f "$CONF_FILE" ]]; then
@@ -75,20 +86,25 @@ EOF
 
 state_get() {
     local user="$1"
-    flock -s "$LOCK_FILE" python3 -c "
-import json, sys
-with open('$STATE_FILE') as f:
-    state = json.load(f)
-u = state.get('$user', {})
-if u:
-    print(f\"memory={u.get('memory_mb', $DEFAULT_MEMORY_MB)}\")
-    print(f\"maxclients={u.get('maxclients', $DEFAULT_MAXCLIENTS)}\")
-    print(f\"enabled_at={u.get('enabled_at', 'unknown')}\")
-    if u.get('redis_dir'):
-        print(f\"redis_dir={u.get('redis_dir')}\")
-else:
+    flock -s "$LOCK_FILE" python3 - "$STATE_FILE" "$user" "$DEFAULT_MEMORY_MB" "$DEFAULT_MAXCLIENTS" <<'PY' 2>/dev/null
+import json
+import sys
+
+state_path, user, default_memory, default_maxclients = sys.argv[1:5]
+with open(state_path) as fh:
+    state = json.load(fh)
+
+entry = state.get(user, {})
+if not entry:
     sys.exit(1)
-" 2>/dev/null
+
+print(f"memory={entry.get('memory_mb', int(default_memory))}")
+print(f"maxclients={entry.get('maxclients', int(default_maxclients))}")
+print(f"enabled_at={entry.get('enabled_at', 'unknown')}")
+redis_dir = entry.get("redis_dir")
+if redis_dir:
+    print(f"redis_dir={redis_dir}")
+PY
 }
 
 state_set() {
@@ -115,24 +131,29 @@ elif existing.get('redis_dir'):
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state_path))
 with os.fdopen(fd, 'w') as f:
     json.dump(state, f, indent=2)
-os.chmod(tmp, 0o644)
+os.chmod(tmp, 0o640)
 os.replace(tmp, state_path)
 PY
 }
 
 state_remove() {
     local user="$1"
-    flock "$LOCK_FILE" python3 -c "
-import json, os, tempfile
-with open('$STATE_FILE') as f:
-    state = json.load(f)
-state.pop('$user', None)
-fd, tmp = tempfile.mkstemp(dir=os.path.dirname('$STATE_FILE'))
-with os.fdopen(fd, 'w') as f:
-    json.dump(state, f, indent=2)
-os.chmod(tmp, 0o644)
-os.rename(tmp, '$STATE_FILE')
-"
+    flock "$LOCK_FILE" python3 - "$STATE_FILE" "$user" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+state_path, user = sys.argv[1:3]
+with open(state_path) as fh:
+    state = json.load(fh)
+state.pop(user, None)
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state_path))
+with os.fdopen(fd, 'w') as fh:
+    json.dump(state, fh, indent=2)
+os.chmod(tmp, 0o640)
+os.replace(tmp, state_path)
+PY
 }
 
 state_total_memory() {
@@ -147,9 +168,9 @@ print(total)
 
 state_redis_dir() {
     local user="$1"
-    local redis_dir=""
-    eval "$(state_get "$user" 2>/dev/null)" || return 1
-    if [[ -n "${redis_dir:-}" ]]; then
+    local _memory="" _maxclients="" _enabled_at="" redis_dir=""
+    state_load "$user" _memory _maxclients _enabled_at redis_dir || return 1
+    if [[ -n "$redis_dir" ]] && user_path_is_safe "$user" "$redis_dir" "parent-if-missing"; then
         printf '%s\n' "$redis_dir"
     fi
 }
@@ -185,6 +206,84 @@ validate_binary() {
         echo "       Install alt-redis or update REDIS_BINARY in $CONF_FILE" >&2
         exit 1
     fi
+}
+
+state_load() {
+    local user="$1"
+    local memory_var="$2"
+    local maxclients_var="$3"
+    local enabled_at_var="${4:-}"
+    local redis_dir_var="${5:-}"
+    local state_dump
+    local parsed_memory="" parsed_maxclients="" parsed_enabled_at="" parsed_redis_dir=""
+    local key value
+
+    state_dump="$(state_get "$user" 2>/dev/null)" || return 1
+    while IFS='=' read -r key value; do
+        case "$key" in
+            memory) parsed_memory="$value" ;;
+            maxclients) parsed_maxclients="$value" ;;
+            enabled_at) parsed_enabled_at="$value" ;;
+            redis_dir) parsed_redis_dir="$value" ;;
+        esac
+    done <<< "$state_dump"
+
+    printf -v "$memory_var" '%s' "$parsed_memory"
+    printf -v "$maxclients_var" '%s' "$parsed_maxclients"
+    if [[ -n "$enabled_at_var" ]]; then
+        printf -v "$enabled_at_var" '%s' "$parsed_enabled_at"
+    fi
+    if [[ -n "$redis_dir_var" ]]; then
+        printf -v "$redis_dir_var" '%s' "$parsed_redis_dir"
+    fi
+}
+
+user_path_is_safe() {
+    local user="$1"
+    local target="$2"
+    local mode="${3:-existing}"
+
+    python3 - "$user" "$target" "$mode" <<'PY' >/dev/null 2>&1
+import os
+import sys
+
+user, target, mode = sys.argv[1:4]
+home = os.path.realpath(f"/home/{user}")
+if not os.path.isdir(home):
+    raise SystemExit(1)
+
+if os.path.lexists(target) and os.path.islink(target):
+    raise SystemExit(1)
+
+probe = target
+if mode == "parent-if-missing" and not os.path.exists(target):
+    probe = os.path.dirname(target) or "."
+
+real_probe = os.path.realpath(probe)
+try:
+    ok = os.path.commonpath([real_probe, home]) == home
+except ValueError:
+    ok = False
+
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+write_file_atomic() {
+    local target="$1"
+    local owner="$2"
+    local mode="$3"
+    local tmp
+
+    tmp="$(mktemp "${target}.tmp.XXXXXX")"
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    chown "$owner" "$tmp"
+    chmod "$mode" "$tmp"
+    mv -f "$tmp" "$target"
 }
 
 guess_cli_for_binary() {
@@ -335,6 +434,15 @@ ensure_redis_dir_layout() {
     desired="$(desired_redis_dir "$user")"
     alternate="$(alternate_redis_dir "$user")"
 
+    if ! user_path_is_safe "$user" "$desired" "parent-if-missing"; then
+        echo "ERROR: Refusing to manage unsafe Redis directory: $desired" >&2
+        exit 1
+    fi
+    if [[ -e "$alternate" ]] && ! user_path_is_safe "$user" "$alternate" "existing"; then
+        echo "ERROR: Refusing to access unsafe alternate Redis directory: $alternate" >&2
+        exit 1
+    fi
+
     mkdir -p "$desired"
     if [[ -d "$alternate" ]]; then
         local moved=0
@@ -419,23 +527,31 @@ deploy_session_locking() {
 
     for docroot in "${docroots[@]}"; do
         [[ -d "$docroot" ]] || continue
+        if ! user_path_is_safe "$user" "$docroot" "existing"; then
+            log "WARN: Skipping unsafe document root for ${user}: ${docroot}"
+            continue
+        fi
         local ini_file="${docroot}/.user.ini"
+        if [[ -e "$ini_file" ]] && ! user_path_is_safe "$user" "$ini_file" "existing"; then
+            log "WARN: Skipping unsafe .user.ini path for ${user}: ${ini_file}"
+            continue
+        fi
 
         # Skip if our block already exists
         if [[ -f "$ini_file" ]] && grep -qF "$USERINI_MARKER_BEGIN" "$ini_file" 2>/dev/null; then
             continue
         fi
 
-        # Append our block
         {
+            if [[ -f "$ini_file" ]]; then
+                cat "$ini_file"
+            fi
             echo ""
             echo "$USERINI_MARKER_BEGIN"
             echo "$USERINI_CONTENT"
             echo "$USERINI_MARKER_END"
-        } >> "$ini_file"
+        } | write_file_atomic "$ini_file" "${user}:${user}" 644
 
-        chown "${user}:${user}" "$ini_file"
-        chmod 644 "$ini_file"
         log "Deployed .user.ini session locking to ${docroot}"
     done
 }
@@ -447,9 +563,14 @@ remove_session_locking() {
     # Find all .user.ini files with our marker
     while IFS= read -r ini_file; do
         [[ -f "$ini_file" ]] || continue
+        if ! user_path_is_safe "$user" "$ini_file" "existing"; then
+            log "WARN: Skipping unsafe .user.ini cleanup path for ${user}: ${ini_file}"
+            continue
+        fi
 
         # Remove our block (marker begin → marker end, inclusive)
-        local tmp="${ini_file}.rmtmp"
+        local tmp
+        tmp="$(mktemp "${ini_file}.tmp.XXXXXX")"
         awk -v begin="$USERINI_MARKER_BEGIN" -v end="$USERINI_MARKER_END" '
             $0 == begin { skip=1; next }
             $0 == end   { skip=0; next }
@@ -464,9 +585,9 @@ remove_session_locking() {
             rm -f "$ini_file" "$tmp"
             log "Removed empty .user.ini from $(dirname "$ini_file")"
         else
+            chown "${user}:${user}" "$tmp"
+            chmod 644 "$tmp"
             mv "$tmp" "$ini_file"
-            chown "${user}:${user}" "$ini_file"
-            chmod 644 "$ini_file"
             log "Cleaned .user.ini session locking from $(dirname "$ini_file")"
         fi
     done < <(find "$homedir" -name ".user.ini" -exec grep -lF "$USERINI_MARKER_BEGIN" {} + 2>/dev/null || true)
@@ -478,15 +599,21 @@ regenerate_config() {
     local user="$1" redis_dir="$2" memory_mb="$3" mc="$4"
     local conf_file="${redis_dir}/redis.conf"
 
+    if ! user_path_is_safe "$user" "$redis_dir" "parent-if-missing"; then
+        echo "ERROR: Refusing to write config outside /home/${user}: $redis_dir" >&2
+        exit 1
+    fi
+    if [[ -e "$conf_file" ]] && ! user_path_is_safe "$user" "$conf_file" "existing"; then
+        echo "ERROR: Refusing to overwrite unsafe config path: $conf_file" >&2
+        exit 1
+    fi
+
     mkdir -p "$redis_dir"
     sed -e "s|{{USERNAME}}|${user}|g" \
         -e "s|{{REDIS_DIR}}|${redis_dir}|g" \
         -e "s|{{MAXMEMORY}}|${memory_mb}|g" \
         -e "s|{{MAXCLIENTS}}|${mc}|g" \
-        "$TEMPLATE_FILE" > "$conf_file"
-
-    chown "${user}:${user}" "$conf_file"
-    chmod 640 "$conf_file"
+        "$TEMPLATE_FILE" | write_file_atomic "$conf_file" "${user}:${user}" 640
 }
 
 render_systemd_unit() {
@@ -525,7 +652,7 @@ update_global_binary_config() {
     local new_binary="$1"
     local new_cli="$2"
 
-    python3 - "$CONF_FILE" "$new_binary" "$new_cli" <<'PY'
+    flock "$CONFIG_LOCK_FILE" python3 - "$CONF_FILE" "$new_binary" "$new_cli" <<'PY'
 import os
 import sys
 import tempfile
@@ -554,6 +681,7 @@ try:
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
     os.replace(tmp, conf_path)
+    os.chmod(conf_path, 0o644)
 finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
@@ -588,6 +716,17 @@ switch_joomla_managed_redis() {
     local desired_socket alternate_socket
     desired_socket="$(desired_redis_dir "$user")/${SOCKET_NAME}"
     alternate_socket="$(alternate_redis_dir "$user")/${SOCKET_NAME}"
+
+    if ! user_path_is_safe "$user" "$file" "existing"; then
+        log "WARN: Skipping unsafe Joomla config path for ${user}: ${file}"
+        printf 'skipped\n'
+        return 0
+    fi
+    if [[ -e "${file}.redismanager.bak" ]] && ! user_path_is_safe "$user" "${file}.redismanager.bak" "existing"; then
+        log "WARN: Skipping unsafe Joomla backup path for ${user}: ${file}.redismanager.bak"
+        printf 'skipped\n'
+        return 0
+    fi
 
     python3 - "$file" "$desired_socket" "$alternate_socket" <<'PY'
 import os
@@ -682,6 +821,8 @@ find_and_switch_joomla_configs() {
         if [[ "$result" == "updated" ]]; then
             changed=$((changed + 1))
             log "Switched Joomla Redis config to safe defaults in $file"
+        elif [[ "$result" == "skipped" ]]; then
+            log "WARN: Skipped Joomla configuration rewrite for unsafe path: $file"
         fi
     done
 
@@ -699,31 +840,25 @@ cmd_enable() {
     validate_user "$user"
     validate_binary
     validate_memory_mb "$memory_mb"
-
-    # Check if already enabled
-    if state_get "$user" &>/dev/null; then
-        echo "WARN: Redis already enabled for '$user'. Use 'restart' or 'set-memory'." >&2
-        exit 1
-    fi
-
-    # Check budget
-    check_budget "$memory_mb"
-
     local maxclients="${DEFAULT_MAXCLIENTS}"
     local redis_dir
     redis_dir="$(desired_redis_dir "$user")"
 
-    # Generate config from template
-    regenerate_config "$user" "$redis_dir" "$memory_mb" "$maxclients"
+    (
+        flock -x 200
 
-    # Enable and start systemd service
-    systemctl enable "redis-managed@${user}" --quiet 2>/dev/null
-    systemctl start "redis-managed@${user}"
+        if state_get "$user" &>/dev/null; then
+            echo "WARN: Redis already enabled for '$user'. Use 'restart' or 'set-memory'." >&2
+            exit 1
+        fi
 
-    # Update state
-    state_set "$user" "$memory_mb" "$maxclients"
+        check_budget "$memory_mb"
+        regenerate_config "$user" "$redis_dir" "$memory_mb" "$maxclients"
+        systemctl enable "redis-managed@${user}" --quiet 2>/dev/null
+        systemctl start "redis-managed@${user}"
+        state_set "$user" "$memory_mb" "$maxclients" "$redis_dir"
+    ) 200>"$BUDGET_LOCK_FILE"
 
-    # Deploy .user.ini with Redis session locking for all document roots
     deploy_session_locking "$user"
 
     log "ENABLED Redis for user=$user memory=${memory_mb}MB"
@@ -785,8 +920,9 @@ cmd_restart() {
         exit 1
     fi
 
-    eval "$(state_get "$user")"
-    local redis_dir="${redis_dir:-$(desired_redis_dir "$user")}"
+    local memory="" maxclients="" enabled_at="" redis_dir=""
+    state_load "$user" memory maxclients enabled_at redis_dir
+    redis_dir="${redis_dir:-$(desired_redis_dir "$user")}"
     state_set "$user" "${memory:-$DEFAULT_MEMORY_MB}" "${maxclients:-$DEFAULT_MAXCLIENTS}" "$redis_dir"
     systemctl restart "redis-managed@${user}"
     log "RESTARTED Redis for user=$user"
@@ -803,7 +939,8 @@ cmd_status() {
 
     # State info
     if state_get "$user" &>/dev/null; then
-        eval "$(state_get "$user")"
+        local memory="" maxclients="" enabled_at="" redis_dir=""
+        state_load "$user" memory maxclients enabled_at redis_dir
         echo "State:      enabled"
         echo "Memory:     ${memory}MB"
         echo "Maxclients: ${maxclients}"
@@ -842,6 +979,12 @@ cmd_status() {
 cmd_flush() {
     local user="$1"
     validate_username_format "$user"
+
+    if ! state_get "$user" &>/dev/null; then
+        echo "ERROR: Redis not enabled for '$user'" >&2
+        exit 1
+    fi
+
     local socket
     socket="$(current_redis_socket "$user")"
 
@@ -858,33 +1001,31 @@ cmd_flush() {
 cmd_set_memory() {
     local user="$1"
     local memory_mb="$2"
+    validate_user "$user"
 
     if ! state_get "$user" &>/dev/null; then
         echo "ERROR: Redis not enabled for '$user'" >&2
         exit 1
     fi
 
-    validate_user "$user"
     validate_memory_mb "$memory_mb"
 
-    # Check budget (subtract current allocation, add new)
-    eval "$(state_get "$user")"
-    local current_alloc="${memory}"
-    local current_maxclients="${maxclients:-$DEFAULT_MAXCLIENTS}"
-    local current_redis_dir="${redis_dir:-}"
-    local delta=$((memory_mb - current_alloc))
-    if [[ $delta -gt 0 ]]; then
-        check_budget "$delta"
-    fi
+    local current_alloc="" current_maxclients="" enabled_at="" current_redis_dir=""
+    (
+        flock -x 200
 
-    local redis_dir
-    redis_dir="${current_redis_dir:-$(desired_redis_dir "$user")}"
+        state_load "$user" current_alloc current_maxclients enabled_at current_redis_dir
+        local delta=$((memory_mb - current_alloc))
+        if [[ $delta -gt 0 ]]; then
+            check_budget "$delta"
+        fi
 
-    regenerate_config "$user" "$redis_dir" "$memory_mb" "$current_maxclients"
-
-    # Update state and restart
-    state_set "$user" "$memory_mb" "$current_maxclients" "$redis_dir"
-    systemctl restart "redis-managed@${user}"
+        local redis_dir
+        redis_dir="${current_redis_dir:-$(desired_redis_dir "$user")}"
+        regenerate_config "$user" "$redis_dir" "$memory_mb" "$current_maxclients"
+        state_set "$user" "$memory_mb" "$current_maxclients" "$redis_dir"
+        systemctl restart "redis-managed@${user}"
+    ) 200>"$BUDGET_LOCK_FILE"
 
     log "SET-MEMORY Redis for user=$user to ${memory_mb}MB"
     echo "Memory limit for '$user' set to ${memory_mb}MB and restarted"
@@ -893,22 +1034,20 @@ cmd_set_memory() {
 cmd_set_maxclients() {
     local user="$1"
     local new_maxclients="$2"
+    validate_user "$user"
 
     if ! state_get "$user" &>/dev/null; then
         echo "ERROR: Redis not enabled for '$user'" >&2
         exit 1
     fi
 
-    validate_user "$user"
-
     if [[ ! "$new_maxclients" =~ ^[0-9]+$ ]] || [[ "$new_maxclients" -lt 8 ]] || [[ "$new_maxclients" -gt 1024 ]]; then
         echo "ERROR: maxclients must be between 8 and 1024" >&2
         exit 1
     fi
 
-    eval "$(state_get "$user")"
-    local current_memory="${memory}"
-    local current_redis_dir="${redis_dir:-}"
+    local current_memory="" current_maxclients="" enabled_at="" current_redis_dir=""
+    state_load "$user" current_memory current_maxclients enabled_at current_redis_dir
 
     local redis_dir
     redis_dir="${current_redis_dir:-$(desired_redis_dir "$user")}"
@@ -943,8 +1082,9 @@ cmd_list() {
         # Get maxclients from state
         local mc="$DEFAULT_MAXCLIENTS"
         if state_get "$user" &>/dev/null; then
-            eval "$(state_get "$user")"
-            mc="${maxclients:-$DEFAULT_MAXCLIENTS}"
+            local list_memory="" list_maxclients="" list_enabled_at="" list_redis_dir=""
+            state_load "$user" list_memory list_maxclients list_enabled_at list_redis_dir
+            mc="${list_maxclients:-$DEFAULT_MAXCLIENTS}"
         fi
 
         local socket
@@ -1008,8 +1148,8 @@ cmd_launch() {
     local redis_dir=""
 
     if state_get "$user" &>/dev/null; then
-        eval "$(state_get "$user")"
-        memory_mb="${memory:-$DEFAULT_MEMORY_MB}"
+        local enabled_at=""
+        state_load "$user" memory_mb maxclients enabled_at redis_dir
         maxclients="${maxclients:-$DEFAULT_MAXCLIENTS}"
         redis_dir="${redis_dir:-}"
     fi

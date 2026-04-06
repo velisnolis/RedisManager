@@ -7,6 +7,7 @@
 #   Whostmgr::Accounts::suspendacct  (post) — stop Redis on suspend
 #   Whostmgr::Accounts::unsuspendacct (post) — restart Redis on unsuspend
 set -euo pipefail
+umask 027
 
 CTL="/opt/redismanager/bin/redismanager-ctl"
 STATE="/var/lib/redismanager/state.json"

@@ -3,6 +3,7 @@
 # Installs to: /opt/redismanager/cron/redismanager-healthcheck
 # Cron: */5 * * * * root /opt/redismanager/cron/redismanager-healthcheck
 set -euo pipefail
+umask 027
 
 CONF="/opt/redismanager/etc/redismanager.conf"
 # shellcheck source=/dev/null
@@ -11,15 +12,62 @@ source "$CONF"
 LOG="${LOG_DIR}/healthcheck.log"
 LOCK_FILE="/var/run/redismanager-state.lock"
 ALERT_THRESHOLD=90  # percentage of budget
+MAX_RESTARTS=5
+RESTART_WINDOW=3600
+RUNTIME_DIR="$(dirname "$STATE_FILE")/healthcheck-runtime"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] HEALTH: $*" >> "$LOG"
+}
+
+restart_state_file() {
+    local user="$1"
+    printf '%s/.restart-%s.state\n' "$RUNTIME_DIR" "$user"
+}
+
+restart_guard_allows_attempt() {
+    local user="$1"
+    local now="$2"
+    local state_file
+    state_file="$(restart_state_file "$user")"
+
+    local window_start=0
+    local attempts=0
+    if [[ -f "$state_file" ]]; then
+        read -r window_start attempts < "$state_file" || true
+    fi
+
+    if [[ -z "${window_start:-}" || -z "${attempts:-}" ]] || [[ ! "$window_start" =~ ^[0-9]+$ ]] || [[ ! "$attempts" =~ ^[0-9]+$ ]]; then
+        window_start=0
+        attempts=0
+    fi
+
+    if (( window_start == 0 || now - window_start >= RESTART_WINDOW )); then
+        window_start="$now"
+        attempts=0
+    fi
+
+    if (( attempts >= MAX_RESTARTS )); then
+        printf '%s %s\n' "$window_start" "$attempts" > "$state_file"
+        return 1
+    fi
+
+    attempts=$((attempts + 1))
+    printf '%s %s\n' "$window_start" "$attempts" > "$state_file"
+    return 0
+}
+
+clear_restart_guard() {
+    local user="$1"
+    rm -f "$(restart_state_file "$user")"
 }
 
 # Read state (shared lock — doesn't block other readers)
 if [[ ! -f "$STATE_FILE" ]]; then
     exit 0
 fi
+
+mkdir -p "$RUNTIME_DIR"
 
 USERS=$(flock -s "$LOCK_FILE" python3 -c "
 import json
@@ -37,6 +85,7 @@ TOTAL_MEM=0
 ACTIVE=0
 RESTARTED=0
 FAILED=0
+SUPPRESSED=0
 
 while IFS=' ' read -r user mem; do
     [[ -z "$user" ]] && continue
@@ -44,8 +93,15 @@ while IFS=' ' read -r user mem; do
 
     if systemctl is-active --quiet "redis-managed@${user}" 2>/dev/null; then
         ACTIVE=$((ACTIVE + 1))
+        clear_restart_guard "$user"
     else
-        # Try to restart
+        now=$(date +%s)
+        if ! restart_guard_allows_attempt "$user" "$now"; then
+            SUPPRESSED=$((SUPPRESSED + 1))
+            log "Restart suppressed for $user: reached ${MAX_RESTARTS} attempts in ${RESTART_WINDOW}s"
+            continue
+        fi
+
         log "Instance for $user is DOWN — attempting restart"
         if systemctl start "redis-managed@${user}" 2>/dev/null; then
             RESTARTED=$((RESTARTED + 1))
@@ -64,6 +120,6 @@ if [[ $USAGE_PCT -ge $ALERT_THRESHOLD ]]; then
 fi
 
 # Only log summary if something happened
-if [[ $RESTARTED -gt 0 || $FAILED -gt 0 ]]; then
-    log "Summary: active=$ACTIVE restarted=$RESTARTED failed=$FAILED memory=${TOTAL_MEM}MB/${TOTAL_BUDGET_MB}MB"
+if [[ $RESTARTED -gt 0 || $FAILED -gt 0 || $SUPPRESSED -gt 0 ]]; then
+    log "Summary: active=$ACTIVE restarted=$RESTARTED failed=$FAILED suppressed=$SUPPRESSED memory=${TOTAL_MEM}MB/${TOTAL_BUDGET_MB}MB"
 fi

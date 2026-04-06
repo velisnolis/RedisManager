@@ -2,6 +2,7 @@
 # RedisManager — uninstaller
 # Run as root: bash uninstall.sh
 set -euo pipefail
+umask 027
 
 INSTALL_DIR="/opt/redismanager"
 STATE_DIR="/var/lib/redismanager"
@@ -10,6 +11,7 @@ WHM_CGI="/usr/local/cpanel/whostmgr/docroot/cgi/addon_redismanager.cgi"
 APPCONFIG="/var/cpanel/apps/addon_redismanager.conf"
 LEGACY_APPCONFIG="/var/cpanel/apps/redismanager.conf"
 CRON_FILE="/etc/cron.d/redismanager"
+LOGROTATE_FILE="/etc/logrotate.d/redismanager"
 
 echo "=== RedisManager Uninstaller ==="
 
@@ -73,6 +75,7 @@ echo "[4/6] Removing cPanel hooks..."
 
 echo "[5/6] Removing cron and symlink..."
 rm -f "$CRON_FILE"
+rm -f "$LOGROTATE_FILE"
 rm -f /usr/local/sbin/redismanager-ctl
 
 echo "[6/6] Removing plugin files..."
