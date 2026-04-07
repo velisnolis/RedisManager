@@ -16,13 +16,6 @@ ISOLATED_REDIS_DIR=".clwpos/redismanager"
 
 umask 027
 
-# The control script manages global state, systemd units, and root-owned files.
-# Keep it root-only so local users cannot introspect or poke internal operations.
-if [[ $EUID -ne 0 ]]; then
-    echo "ERROR: Must run as root" >&2
-    exit 1
-fi
-
 # Load configuration
 if [[ ! -f "$CONF_FILE" ]]; then
     echo "ERROR: Config file not found: $CONF_FILE" >&2
@@ -31,13 +24,16 @@ fi
 # shellcheck source=/dev/null
 source "$CONF_FILE"
 
-# Ensure state directory exists
+# Ensure state/log directories exist when running an admin command as root.
+# The systemd `launch` path runs as the cPanel user and must not try to mkdir
+# inside /var/lib or /var/log on every start.
 STATE_DIR="$(dirname "$STATE_FILE")"
-mkdir -p "$STATE_DIR" "$LOG_DIR"
+if [[ $EUID -eq 0 ]]; then
+    mkdir -p "$STATE_DIR" "$LOG_DIR"
 
-# Initialize state file if missing
-if [[ ! -f "$STATE_FILE" ]]; then
-    echo '{}' > "$STATE_FILE"
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo '{}' > "$STATE_FILE"
+    fi
 fi
 
 # --- Username validation ---
@@ -86,7 +82,8 @@ EOF
 
 state_get() {
     local user="$1"
-    flock -s "$LOCK_FILE" python3 - "$STATE_FILE" "$user" "$DEFAULT_MEMORY_MB" "$DEFAULT_MAXCLIENTS" <<'PY' 2>/dev/null
+    if [[ $EUID -eq 0 ]]; then
+        flock -s "$LOCK_FILE" python3 - "$STATE_FILE" "$user" "$DEFAULT_MEMORY_MB" "$DEFAULT_MAXCLIENTS" <<'PY' 2>/dev/null
 import json
 import sys
 
@@ -105,6 +102,27 @@ redis_dir = entry.get("redis_dir")
 if redis_dir:
     print(f"redis_dir={redis_dir}")
 PY
+    else
+        python3 - "$STATE_FILE" "$user" "$DEFAULT_MEMORY_MB" "$DEFAULT_MAXCLIENTS" <<'PY' 2>/dev/null
+import json
+import sys
+
+state_path, user, default_memory, default_maxclients = sys.argv[1:5]
+with open(state_path) as fh:
+    state = json.load(fh)
+
+entry = state.get(user, {})
+if not entry:
+    sys.exit(1)
+
+print(f"memory={entry.get('memory_mb', int(default_memory))}")
+print(f"maxclients={entry.get('maxclients', int(default_maxclients))}")
+print(f"enabled_at={entry.get('enabled_at', 'unknown')}")
+redis_dir = entry.get("redis_dir")
+if redis_dir:
+    print(f"redis_dir={redis_dir}")
+PY
+    fi
 }
 
 state_set() {
@@ -131,7 +149,7 @@ elif existing.get('redis_dir'):
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state_path))
 with os.fdopen(fd, 'w') as f:
     json.dump(state, f, indent=2)
-os.chmod(tmp, 0o640)
+os.chmod(tmp, 0o644)
 os.replace(tmp, state_path)
 PY
 }
@@ -151,7 +169,7 @@ state.pop(user, None)
 fd, tmp = tempfile.mkstemp(dir=os.path.dirname(state_path))
 with os.fdopen(fd, 'w') as fh:
     json.dump(state, fh, indent=2)
-os.chmod(tmp, 0o640)
+os.chmod(tmp, 0o644)
 os.replace(tmp, state_path)
 PY
 }
@@ -281,7 +299,9 @@ write_file_atomic() {
         return 1
     fi
 
-    chown "$owner" "$tmp"
+    if [[ $EUID -eq 0 ]]; then
+        chown "$owner" "$tmp"
+    fi
     chmod "$mode" "$tmp"
     mv -f "$tmp" "$target"
 }
@@ -461,7 +481,9 @@ ensure_redis_dir_layout() {
         fi
     fi
 
-    chown -R "${user}:${user}" "$desired"
+    if [[ $EUID -eq 0 ]]; then
+        chown -R "${user}:${user}" "$desired"
+    fi
     chmod 750 "$desired"
 }
 
@@ -502,6 +524,61 @@ USERINI_MARKER_END="; <<< RedisManager"
 USERINI_CONTENT="redis.session.locking_enabled = 1
 redis.session.lock_retries = 300
 redis.session.lock_wait_time = 10000"
+USERINI_LEGACY_COMMENT="; RedisManager — session locking for Redis"
+
+normalize_session_locking_file() {
+    local mode="$1"
+    local ini_file="$2"
+
+    python3 - "$mode" "$ini_file" "$USERINI_MARKER_BEGIN" "$USERINI_MARKER_END" "$USERINI_LEGACY_COMMENT" "$USERINI_CONTENT" <<'PY'
+import pathlib
+import sys
+
+mode, ini_path, marker_begin, marker_end, legacy_comment, content = sys.argv[1:7]
+content_lines = content.splitlines()
+src = pathlib.Path(ini_path)
+lines = src.read_text().splitlines() if src.exists() else []
+
+out = []
+i = 0
+while i < len(lines):
+    line = lines[i]
+
+    if line == marker_begin:
+        i += 1
+        while i < len(lines) and lines[i] != marker_end:
+            i += 1
+        if i < len(lines) and lines[i] == marker_end:
+            i += 1
+        continue
+
+    if line == legacy_comment and lines[i + 1:i + 1 + len(content_lines)] == content_lines:
+        i += 1 + len(content_lines)
+        if i < len(lines) and lines[i] == "":
+            i += 1
+        continue
+
+    if lines[i:i + len(content_lines)] == content_lines:
+        i += len(content_lines)
+        if i < len(lines) and lines[i] == "":
+            i += 1
+        continue
+
+    out.append(line)
+    i += 1
+
+while out and out[-1] == "":
+    out.pop()
+
+if mode == "deploy":
+    if out:
+        out.append("")
+    out.extend([marker_begin, *content_lines, marker_end])
+
+if out:
+    sys.stdout.write("\n".join(out) + "\n")
+PY
+}
 
 deploy_session_locking() {
     local user="$1"
@@ -537,20 +614,7 @@ deploy_session_locking() {
             continue
         fi
 
-        # Skip if our block already exists
-        if [[ -f "$ini_file" ]] && grep -qF "$USERINI_MARKER_BEGIN" "$ini_file" 2>/dev/null; then
-            continue
-        fi
-
-        {
-            if [[ -f "$ini_file" ]]; then
-                cat "$ini_file"
-            fi
-            echo ""
-            echo "$USERINI_MARKER_BEGIN"
-            echo "$USERINI_CONTENT"
-            echo "$USERINI_MARKER_END"
-        } | write_file_atomic "$ini_file" "${user}:${user}" 644
+        normalize_session_locking_file "deploy" "$ini_file" | write_file_atomic "$ini_file" "${user}:${user}" 644
 
         log "Deployed .user.ini session locking to ${docroot}"
     done
@@ -560,7 +624,9 @@ remove_session_locking() {
     local user="$1"
     local homedir="/home/${user}"
 
-    # Find all .user.ini files with our marker
+    # Find all .user.ini files in the account; older RedisManager versions wrote
+    # the same settings without markers, so cleanup must also handle that legacy
+    # format.
     while IFS= read -r ini_file; do
         [[ -f "$ini_file" ]] || continue
         if ! user_path_is_safe "$user" "$ini_file" "existing"; then
@@ -568,14 +634,9 @@ remove_session_locking() {
             continue
         fi
 
-        # Remove our block (marker begin → marker end, inclusive)
         local tmp
         tmp="$(mktemp "${ini_file}.tmp.XXXXXX")"
-        awk -v begin="$USERINI_MARKER_BEGIN" -v end="$USERINI_MARKER_END" '
-            $0 == begin { skip=1; next }
-            $0 == end   { skip=0; next }
-            !skip { print }
-        ' "$ini_file" > "$tmp"
+        normalize_session_locking_file "remove" "$ini_file" > "$tmp"
 
         # Remove trailing blank lines
         sed -i -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$tmp" 2>/dev/null || true
@@ -590,7 +651,7 @@ remove_session_locking() {
             mv "$tmp" "$ini_file"
             log "Cleaned .user.ini session locking from $(dirname "$ini_file")"
         fi
-    done < <(find "$homedir" -name ".user.ini" -exec grep -lF "$USERINI_MARKER_BEGIN" {} + 2>/dev/null || true)
+    done < <(find "$homedir" -name ".user.ini" 2>/dev/null || true)
 }
 
 # --- Helpers ---
@@ -853,6 +914,7 @@ cmd_enable() {
         fi
 
         check_budget "$memory_mb"
+        ensure_redis_dir_layout "$user"
         regenerate_config "$user" "$redis_dir" "$memory_mb" "$maxclients"
         systemctl enable "redis-managed@${user}" --quiet 2>/dev/null
         systemctl start "redis-managed@${user}"
@@ -1213,6 +1275,13 @@ fi
 
 CMD="$1"
 shift
+
+# systemd launches Redis instances as the target cPanel user. Allow only the
+# internal `launch` path to run without root; keep every admin command root-only.
+if [[ "$CMD" != "launch" && $EUID -ne 0 ]]; then
+    echo "ERROR: Must run as root" >&2
+    exit 1
+fi
 
 case "$CMD" in
     enable)

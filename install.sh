@@ -35,7 +35,7 @@ fi
 echo "[1/7] Installing files to ${INSTALL_DIR}..."
 mkdir -p "${INSTALL_DIR}"/{bin,etc,templates,hooks,cron}
 mkdir -p "$STATE_DIR" "$LOG_DIR"
-chmod 750 "$STATE_DIR" "$LOG_DIR"
+chmod 755 "$STATE_DIR" "$LOG_DIR"
 
 # Copy files from source directory (same dir as this script)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -47,7 +47,7 @@ cp "$SCRIPT_DIR/templates/redismanager.logrotate" "$INSTALL_DIR/templates/"
 cp "$SCRIPT_DIR/hooks/redismanager-hooks"         "$INSTALL_DIR/hooks/"
 cp "$SCRIPT_DIR/cron/redismanager-healthcheck"    "$INSTALL_DIR/cron/"
 
-chmod 750 "$INSTALL_DIR/bin/redismanager-ctl"
+chmod 755 "$INSTALL_DIR/bin/redismanager-ctl"
 chmod 750 "$INSTALL_DIR/hooks/redismanager-hooks"
 chmod 750 "$INSTALL_DIR/cron/redismanager-healthcheck"
 chmod 644 "$INSTALL_DIR/etc/redismanager.conf"
@@ -57,7 +57,7 @@ chmod 644 "$INSTALL_DIR/templates/redismanager.logrotate"
 if [[ ! -f "$STATE_DIR/state.json" ]]; then
     echo '{}' > "$STATE_DIR/state.json"
 fi
-chmod 640 "$STATE_DIR/state.json"
+chmod 644 "$STATE_DIR/state.json"
 
 echo "[2/7] Installing systemd template unit..."
 cp "$SCRIPT_DIR/templates/redis-managed.service" "$INSTALL_DIR/templates/"
