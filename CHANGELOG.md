@@ -1,5 +1,18 @@
 # Changelog
 
+## 2026-04-07
+
+### Fixed
+
+- Restored compatibility between `redismanager-ctl launch` and the production systemd unit, which runs managed Redis instances as the cPanel account user instead of `root`.
+- Reopened runtime permissions required by the non-root launch path for the control script, state file, and runtime directories.
+- Normalized `.user.ini` session-locking management so legacy unmarked entries do not accumulate alongside the newer marked block format.
+
+### Operational notes
+
+- A production incident after the 2026-04-06 hardening deploy caused temporary `500` errors on sites backed by managed Redis instances.
+- The root cause and recovery steps are recorded in [docs/POSTMORTEM-2026-04-07-runtime-permissions.md](docs/POSTMORTEM-2026-04-07-runtime-permissions.md).
+
 ## 2026-04-06
 
 ### Changed
