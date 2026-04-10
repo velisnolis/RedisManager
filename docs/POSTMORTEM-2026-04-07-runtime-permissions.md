@@ -77,3 +77,16 @@ Després del fix i la neteja:
 - Evitar futurs hardenings que assumeixin `root-only` sense revisar abans la unitat systemd real.
 - Conservar la compatibilitat amb `.user.ini` legacy mentre hi hagi instal·lacions antigues en producció.
 - Revisar i esborrar backups temporals després del període de soak acordat.
+
+## Tancament operatiu
+
+El `2026-04-10`, un cop superat el període de soak sense regressions i amb validació final correcta (`HTTP 200` als tres sites afectats i instàncies Redis `active`), es van eliminar els backups temporals creats durant la resposta a l'incident.
+
+Es van esborrar:
+
+- `/root/redismanager-backup-20260406-104424`
+- `/root/redismanager-cleanup-preflight-20260407-082535.txt`
+- `/opt/redismanager/bin/redismanager-ctl.bak-20260407-083149`
+- `/home/aico/public_html/.user.ini.bak-20260407-083011`
+
+El snapshot del servidor es manté com a còpia de seguretat forta prèvia a la intervenció.
